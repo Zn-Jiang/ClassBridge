@@ -25,3 +25,9 @@ end = "10:10"
 name = "lunch_break"
 start = "12:00"
 end = "14:00"
+
+[challenge]
+challenge_url = "http://127.0.0.1:1002/challenge"
+verify_url = "http://127.0.0.1:1002/verify"
+fallback_question = "密码"
+fallback_answer = "replace-with-a-strong-password"

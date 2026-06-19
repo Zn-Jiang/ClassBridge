@@ -127,6 +127,10 @@ class ClientConfig:
     reconnect_max_delay_seconds: int = 60
     schedule_timezone: str = "Asia/Shanghai"
     schedule_breaks: List[ScheduleBreak] = field(default_factory=list)
+    challenge_url: str = "http://127.0.0.1:1002/challenge"
+    verify_url: str = "http://127.0.0.1:1002/verify"
+    fallback_question: str = "密码"
+    fallback_answer: str = "change-me"
 
     def resolved_client_ws_url(self) -> str:
         return self.server_ws_url
@@ -143,6 +147,7 @@ def load_client_config(config_path: Optional[Path] = None) -> ClientConfig:
     raw = _load_toml(path)
     section = raw.get("client", {})
     sched = raw.get("schedule", {})
+    challenge = raw.get("challenge", {})
 
     breaks = [
         ScheduleBreak(
@@ -176,6 +181,10 @@ def load_client_config(config_path: Optional[Path] = None) -> ClientConfig:
         )),
         schedule_timezone=_opt_str(sched.get("timezone"), ClientConfig().schedule_timezone),
         schedule_breaks=breaks,
+        challenge_url=_opt_str(challenge.get("challenge_url"), ClientConfig().challenge_url),
+        verify_url=_opt_str(challenge.get("verify_url"), ClientConfig().verify_url),
+        fallback_question=_opt_str(challenge.get("fallback_question"), ClientConfig().fallback_question),
+        fallback_answer=_opt_str(challenge.get("fallback_answer"), ClientConfig().fallback_answer),
     )
 
 
@@ -220,7 +229,15 @@ def _dump_client_toml(config: ClientConfig) -> str:
             f'start = "{_esc(item.start)}"',
             f'end = "{_esc(item.end)}"',
         ])
-    lines.append("")
+    lines.extend([
+        "",
+        "[challenge]",
+        f'challenge_url = "{_esc(config.challenge_url)}"',
+        f'verify_url = "{_esc(config.verify_url)}"',
+        f'fallback_question = "{_esc(config.fallback_question)}"',
+        f'fallback_answer = "{_esc(config.fallback_answer)}"',
+        "",
+    ])
     return "\n".join(lines)
 
 

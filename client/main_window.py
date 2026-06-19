@@ -507,9 +507,18 @@ class BreakMonitorThread(QThread):
 
 
 class ChallengeDialog(QDialog):
-    def __init__(self, challenge: Challenge, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        challenge: Challenge,
+        *,
+        verify_url: str = "http://127.0.0.1:1002/verify",
+        fallback_answer: str = "change-me",
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self._challenge = challenge
+        self._verify_url = verify_url
+        self._fallback_answer = fallback_answer
         self.setWindowTitle("验证访问")
         self.resize(420, 220)
         self._build_ui()
@@ -542,7 +551,11 @@ class ChallengeDialog(QDialog):
         if not answer:
             self.status_label.setText("请输入答案。")
             return
-        ok, message = verify_with_challenge(self._challenge, answer)
+        ok, message = verify_with_challenge(
+            self._challenge, answer,
+            verify_url=self._verify_url,
+            fallback_answer=self._fallback_answer,
+        )
         if ok:
             self.accept()
             return
@@ -739,7 +752,21 @@ class SettingsPage(QWidget):
         super().hideEvent(event)
 
     def _verify_access(self) -> bool:
-        return ChallengeDialog(Challenge.fetch(), self).exec() == QDialog.DialogCode.Accepted
+        config = self._config
+        challenge = Challenge.fetch(
+            config.challenge_url,
+            fallback_question=config.fallback_question,
+            fallback_answer=config.fallback_answer,
+        )
+        return (
+            ChallengeDialog(
+                challenge,
+                verify_url=config.verify_url,
+                fallback_answer=config.fallback_answer,
+                parent=self,
+            ).exec()
+            == QDialog.DialogCode.Accepted
+        )
 
     def _unlock_server_url(self) -> None:
         if self._verify_access():
