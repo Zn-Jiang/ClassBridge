@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.db
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Testing / type checking
+.pytest_cache/
+.mypy_cache/
+
+# Dev scripts (smoke tests, integration probes – not part of the product)
+scripts/
+
+# Logs
+logs/*
+!logs/.gitkeep
+
+# Runtime data
+data/*
+!data/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project config files with secrets (templates are committed)
+configs/server.toml
+configs/client.toml
+configs/plugin.toml
+
+# NapCat QQ framework (large binaries, external dependency)
+NapCat.Shell.Windows.OneKey/
+
+# NoneBot / NapCat runtime
+Nonebot/kgGao29Robot/.venv/
+Nonebot/keystore.json
+Nonebot/device.json
+Nonebot/appsettings.json
+
+# Archive files
+*.zip
+*.7z
+*.rar
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
