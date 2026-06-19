@@ -1,0 +1,5 @@
+ntplib==0.4.0
+PyQt6==6.11.0
+pyqt6_fluent_widgets==1.10.5
+shared==0.0.32
+websockets==11.0.3
