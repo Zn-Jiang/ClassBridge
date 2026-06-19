@@ -56,3 +56,6 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+#client
+client/schedule/test.json
