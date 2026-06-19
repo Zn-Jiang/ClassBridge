@@ -39,6 +39,7 @@ configs/plugin.toml
 NapCat.Shell.Windows.OneKey/
 
 # NoneBot / NapCat runtime
+Nonebot/corefunction.py
 Nonebot/kgGao29Robot/.venv/
 Nonebot/keystore.json
 Nonebot/device.json
