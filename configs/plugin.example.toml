@@ -1,8 +1,0 @@
-internal_token = "replace-with-a-random-token"
-server_ws_url = "ws://127.0.0.1:8765/ws/plugin"
-
-[plugin]
-bot_name = "kgGao29MessageBot"
-class_group_ids = [123456789]
-admin_users = [123456789]
-short_id_ttl_seconds = 300
