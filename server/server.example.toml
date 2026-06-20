@@ -1,0 +1,11 @@
+internal_token = "replace-with-a-random-token"
+
+[server]
+host = "127.0.0.1"
+port = 8765
+database_path = "data/app.db"
+log_level = "INFO"
+client_ws_path = "/ws/client"
+plugin_ws_path = "/ws/plugin"
+client_name = "classroom-desktop"
+short_id_ttl_seconds = 300
