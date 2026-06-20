@@ -1,21 +1,21 @@
 <div align="center">
-  <div style="display: flex; align-items: center; justify-content: center; gap: 12px;">
-    <img src="client/icon.png" alt="ClassBridge" style="height: 40px; width: auto; display: block; margin-top: 20px;">
-    <h1 style="font-size: 3em; margin: 0; line-height: 1.2;">ClassBridge</h1>
+
+# <image src="client/icon.png" height="28" width="28"/> ClassBridge
+  <div style="margin-top: -16px;">
+    <h3 style="color: #666666; font-weight: 400; font-size: 1.25em; margin-bottom: 20px;">教室 QQ 消息投屏系统</h3>
+    <p style="margin-bottom: 25px;">
+        <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
+        &nbsp;
+        <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.9.7%2B-blue?logo=python&logoColor=white" alt="Python 3.9.7+"></a>
+        &nbsp;
+        <img src="https://img.shields.io/badge/Windows_10-22H2-0078D6?logo=windows&logoColor=white" alt="Windows 10 22H2">
+        &nbsp;
+        <img src="https://img.shields.io/badge/Windows_Server-2022-0078D6?logo=windows&logoColor=white" alt="Windows Server 2022">
+    </p>
   </div>
-  <p style="font-size: 1.3em; color: #666; margin-top: -6px; margin-bottom: 20px;">
-    教室 QQ 消息投屏系统
-  </p>
-  <p>
-    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
-    &nbsp;
-    <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.9.7%2B-blue?logo=python&logoColor=white" alt="Python 3.9.7+"></a>
-    &nbsp;
-    <img src="https://img.shields.io/badge/Windows_10-22H2-0078D6?logo=windows&logoColor=white" alt="Windows 10 22H2">
-    &nbsp;
-    <img src="https://img.shields.io/badge/Windows_Server-2022-0078D6?logo=windows&logoColor=white" alt="Windows Server 2022">
-  </p>
 </div>
+
+---
 
 家长在 QQ 群里发消息，实时转发到教室大屏幕上。支持消息优先级（普通 / 紧急）、已读回执、撤回、重发、考试静默模式、课间自动弹窗、管理员（科任老师）私聊。
 
