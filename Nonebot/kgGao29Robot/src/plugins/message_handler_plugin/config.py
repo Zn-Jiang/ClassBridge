@@ -10,6 +10,8 @@ ROOT_DIR = Path(__file__).resolve().parents[5]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+_PLUGIN_DIR = Path(__file__).resolve().parents[3]  # kgGao29Robot/
+
 from shared.config import load_plugin_toml_config
 
 
@@ -27,7 +29,7 @@ class Config(BaseModel):
 def merge_with_plugin_config(runtime_config: Config) -> Config:
     """Use NoneBot runtime config first, then fall back to configs/plugin.toml."""
 
-    plugin = load_plugin_toml_config()
+    plugin = load_plugin_toml_config(_PLUGIN_DIR / "plugin.toml")
 
     merged = runtime_config.model_copy(
         update={

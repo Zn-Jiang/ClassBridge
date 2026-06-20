@@ -63,7 +63,6 @@ ICON_ICO_PATH = CLIENT_DIR / "icon.ico"
 ICON_PNG_PATH = CLIENT_DIR / "icon.png"
 RETENTION_OPTIONS = {"1月": 30, "3月": 90, "1年": 365, "永久": 0}
 logger = logging.getLogger("kg.client.main_window")
-logger = logging.getLogger("kg.client.main_window")
 
 
 class FlatMessageWidget(QWidget):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from json import dumps
+from pathlib import Path
 from typing import Optional
 
 import websockets
@@ -16,10 +17,12 @@ from .database import Database
 from .service import ServerService
 from .short_id import ShortIdStore
 
+_SERVER_DIR = Path(__file__).resolve().parent
+
 
 class ServerApplication:
     def __init__(self) -> None:
-        self.config = load_server_config()
+        self.config = load_server_config(_SERVER_DIR / "server.toml")
         self.logger = configure_logging("kg.server", "server.log", self.config.log_level)
         self.database = Database(self.config)
         self.short_ids = ShortIdStore()
