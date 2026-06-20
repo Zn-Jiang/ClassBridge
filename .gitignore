@@ -30,10 +30,10 @@ data/*
 *.swp
 *.swo
 
-# Project config files with secrets (templates are committed)
-configs/server.toml
-configs/client.toml
-configs/plugin.toml
+# Per-component config files with secrets (templates are committed)
+server/server.toml
+client/client.toml
+Nonebot/kgGao29Robot/plugin.toml
 
 # NapCat QQ framework (large binaries, external dependency)
 NapCat.Shell.Windows.OneKey/
