@@ -13,8 +13,7 @@ HELP_TEXT = """可用指令：
 /重发 短ID
 
 发送消息（在群内）：
-@机器人 记得带雨伞
-"""
+@机器人 记得带雨伞"""
 
 
 def parse_user_input(text: str) -> Dict[str, Optional[str]]:
