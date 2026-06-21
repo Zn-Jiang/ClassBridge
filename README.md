@@ -1,6 +1,6 @@
 <div align="center">
 
-# <image src="client/icon.png" height="28" width="28"/> ClassBridge
+# <image src="README_source/icon.png" height="28" width="28"/> ClassBridge
   <div style="margin-top: -16px;">
     <h3 style="color: #666666; font-weight: 400; font-size: 1.25em; margin-bottom: 20px;">教室 QQ 消息投屏系统</h3>
     <p style="margin-bottom: 25px;">
@@ -259,8 +259,6 @@ nb run
 
 ```
 @机器人 快递放东门了
-
-@机器人 /紧急消息 我到门口了，快出来
 ```
 
 可用指令：

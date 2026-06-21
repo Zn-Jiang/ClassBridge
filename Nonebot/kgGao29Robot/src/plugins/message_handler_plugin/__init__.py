@@ -95,6 +95,9 @@ async def handle_message(bot: Bot, event: MessageEvent) -> None:
         await _handle_resend(bot, event, parsed["content"] or "")
         return
     if kind == "dispatch":
+        if parsed["command"] == "/紧急消息" and isinstance(event, GroupMessageEvent):
+            await _reply(bot, event, "紧急消息仅限管理员私聊发送。")
+            return
         await _handle_dispatch(bot, event, parsed["content"] or "", parsed["command"])
 
 
