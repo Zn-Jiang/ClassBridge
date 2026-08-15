@@ -4,6 +4,10 @@ log_level = "INFO"
 
 [client]
 client_name = "classroom-desktop"
+# schedule_source = "schedule/schedule.json"    # uncomment to pin a JSON schedule
+# schedule_source = "__classisland__"            # or use ClassIsland real-time events
+# last_valid_schedule_source = "schedule/schedule.json"
+classisland_ws_url = "ws://localhost:6614/status"
 ntp_server = "ntp.aliyun.com"
 auto_popup_on_break = true
 close_to_tray = true

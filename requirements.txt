@@ -8,4 +8,5 @@ PyQt6>=6.7,<7.0
 PyQt6-Fluent-Widgets>=1.5,<2.0
 ntplib>=0.4,<1.0
 tomli>=2.0,<3.0; python_version < "3.11"
+openai>=1.0,<2.0
 
