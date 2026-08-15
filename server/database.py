@@ -51,6 +51,7 @@ class ClientStateModel(Base):
     client_name: Mapped[str] = mapped_column(String(128), nullable=False, default="classroom-desktop")
     is_online: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     mode: Mapped[str] = mapped_column(String(16), nullable=False, default=ClientMode.NORMAL.value)
+    is_in_break: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=local_now)
 
 
@@ -260,6 +261,7 @@ class Database:
         client_name: Optional[str],
         is_online: bool,
         mode: ClientMode,
+        is_in_break: bool = False,
     ) -> ClientStatusPayload:
         with self.session() as session:
             state = self._get_or_create_client_state(session)
@@ -267,6 +269,7 @@ class Database:
                 state.client_name = client_name
             state.is_online = is_online
             state.mode = mode.value
+            state.is_in_break = is_in_break
             state.updated_at = local_now()
             session.commit()
             session.refresh(state)
@@ -295,6 +298,13 @@ class Database:
             }
             if "source_message_id" not in message_columns:
                 connection.execute(text("ALTER TABLE messages ADD COLUMN source_message_id INTEGER"))
+
+            state_columns = {
+                row[1]
+                for row in connection.execute(text("PRAGMA table_info(client_state)")).fetchall()
+            }
+            if "is_in_break" not in state_columns:
+                connection.execute(text("ALTER TABLE client_state ADD COLUMN is_in_break BOOLEAN NOT NULL DEFAULT 0"))
 
     def _resolve_database_path(self, raw_path: str) -> Path:
         path = Path(raw_path)
@@ -342,5 +352,6 @@ def _to_client_status_payload(model: ClientStateModel) -> ClientStatusPayload:
         client_name=model.client_name,
         is_online=bool(model.is_online),
         mode=ClientMode(model.mode),
+        is_in_break=bool(model.is_in_break),
         updated_at=_format_datetime(model.updated_at) or "",
     )

@@ -26,6 +26,7 @@ class ClientWorker(QThread):
         self._commands: Queue[Dict[str, Any]] = Queue()
         self._running = True
         self._exam_mode = False
+        self._is_in_break = False
 
     def stop(self) -> None:
         self._running = False
@@ -37,6 +38,10 @@ class ClientWorker(QThread):
     def set_exam_mode(self, enabled: bool) -> None:
         self._exam_mode = enabled
         self._commands.put({"type": "status_update", "is_online": True, "mode": self._current_mode().value})
+
+    def set_is_in_break(self, in_break: bool) -> None:
+        """Called from the main thread to update the break state sent to the server."""
+        self._is_in_break = in_break
 
     def request_snapshot(self) -> None:
         self._commands.put({"type": "snapshot"})
@@ -128,6 +133,7 @@ class ClientWorker(QThread):
                 "client_name": self._config.client_name,
                 "is_online": is_online,
                 "mode": self._current_mode().value,
+                "is_in_break": self._is_in_break,
             },
         )
         if response.type == MessageType.ERROR.value:

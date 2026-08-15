@@ -233,6 +233,7 @@ class ServerService:
             client_name=client_name,
             is_online=bool(data.get("is_online", True)),
             mode=mode,
+            is_in_break=bool(data.get("is_in_break", False)),
         )
         return envelope_to_dict(
             make_envelope(

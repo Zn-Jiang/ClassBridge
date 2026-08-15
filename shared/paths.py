@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -14,6 +15,18 @@ def _resolve_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _resolve_appdata_dir() -> Path:
+    """Return the per-user application data directory for the client.
+
+    On Windows this is ``%APPDATA%/ClassBridge``.
+    On other platforms this is ``~/.classbridge``.
+    """
+    appdata_root = os.environ.get("APPDATA")
+    if appdata_root:
+        return Path(appdata_root) / "新江" / "ClassBridge"
+    return Path.home() / ".classbridge"
+
+
 ROOT_DIR = _resolve_root()
 CONFIG_DIR = ROOT_DIR / "configs"  # kept for backward-compat reference only
 LOG_DIR = ROOT_DIR / "logs"
@@ -24,12 +37,22 @@ PLUGIN_DIR = NONEBOT_DIR / "src" / "plugins" / "message_handler_plugin"
 # Per-component config paths (each lives inside its own module directory)
 SERVER_CONFIG_PATH = ROOT_DIR / "server" / "server.toml"
 SERVER_EXAMPLE_CONFIG_PATH = ROOT_DIR / "server" / "server.example.toml"
-CLIENT_CONFIG_PATH = ROOT_DIR / "client" / "client.toml"
-CLIENT_EXAMPLE_CONFIG_PATH = ROOT_DIR / "client" / "client.example.toml"
 PLUGIN_CONFIG_PATH = NONEBOT_DIR / "plugin.toml"
 PLUGIN_EXAMPLE_CONFIG_PATH = NONEBOT_DIR / "plugin.example.toml"
+
+# Client data lives in the per-user appdata directory (Windows convention).
+CLIENT_APPDATA_DIR = _resolve_appdata_dir()
+CLIENT_CONFIG_PATH = CLIENT_APPDATA_DIR / "client.toml"
+CLIENT_EXAMPLE_CONFIG_PATH = ROOT_DIR / "client" / "client.example.toml"
+CLIENT_DATABASE_PATH = CLIENT_APPDATA_DIR / "client.db"
 
 
 def ensure_runtime_dirs() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_client_appdata_dir() -> Path:
+    """Create and return the client appdata directory."""
+    CLIENT_APPDATA_DIR.mkdir(parents=True, exist_ok=True)
+    return CLIENT_APPDATA_DIR

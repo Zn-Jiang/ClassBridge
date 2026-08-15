@@ -41,6 +41,7 @@ def build_store_feedback(payload: Dict[str, Any], msg_type: MessagePriority) -> 
     client_status = payload.get("client_status", {})
     mode = client_status.get("mode", ClientMode.NORMAL.value)
     is_online = bool(client_status.get("is_online", False))
+    is_in_break = bool(client_status.get("is_in_break", False))
     label = "紧急" if msg_type == MessagePriority.URGENT else "普通"
     if label == "普通":
         label = ""
@@ -48,6 +49,8 @@ def build_store_feedback(payload: Dict[str, Any], msg_type: MessagePriority) -> 
         return f"提示：学生端当前离线，您的{label}消息已存入消息服务器，上线后将立即提醒。"
     if mode == ClientMode.EXAM.value:
         return f"提示：学生端正处于考试静默模式，您的{label}消息已转发，但查看可能延迟。"
+    if not is_in_break:
+        return f"提示：当前正在上课，您的{label}消息已转发到客户端，学生将在课间查看。"
     return f"您的{label}消息已转发到客户端。"
 
 

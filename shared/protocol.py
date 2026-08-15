@@ -85,6 +85,7 @@ class ClientStatusPayload:
     is_online: bool
     mode: ClientMode
     updated_at: str
+    is_in_break: bool = False  # True when the client reports it is currently in a break period
 
 
 @dataclass

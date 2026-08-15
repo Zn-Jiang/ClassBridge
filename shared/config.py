@@ -117,6 +117,7 @@ class ClientConfig:
     client_name: str = "classroom-desktop"
     schedule_source: Optional[str] = None
     last_valid_schedule_source: Optional[str] = None
+    classisland_ws_url: str = "ws://localhost:6614/status"
     ntp_server: str = "ntp.aliyun.com"
     auto_popup_on_break: bool = True
     close_to_tray: bool = True
@@ -165,6 +166,7 @@ def load_client_config(config_path: Optional[Path] = None) -> ClientConfig:
         client_name=_opt_str(section.get("client_name"), ClientConfig().client_name),
         schedule_source=_none_if_empty(section.get("schedule_source")),
         last_valid_schedule_source=_none_if_empty(section.get("last_valid_schedule_source")),
+        classisland_ws_url=_opt_str(section.get("classisland_ws_url"), ClientConfig().classisland_ws_url),
         ntp_server=_opt_str(section.get("ntp_server"), ClientConfig().ntp_server),
         auto_popup_on_break=bool(section.get("auto_popup_on_break", ClientConfig().auto_popup_on_break)),
         close_to_tray=bool(section.get("close_to_tray", ClientConfig().close_to_tray)),
@@ -209,6 +211,7 @@ def _dump_client_toml(config: ClientConfig) -> str:
     if config.last_valid_schedule_source:
         lines.append(f'last_valid_schedule_source = "{_esc(config.last_valid_schedule_source)}"')
     lines.extend([
+        f'classisland_ws_url = "{_esc(config.classisland_ws_url)}"',
         f'ntp_server = "{_esc(config.ntp_server)}"',
         f"auto_popup_on_break = {_bool_str(config.auto_popup_on_break)}",
         f"close_to_tray = {_bool_str(config.close_to_tray)}",
@@ -256,6 +259,9 @@ class PluginTomlConfig:
     class_group_ids: List[int] = field(default_factory=list)
     admin_users: List[int] = field(default_factory=list)
     short_id_ttl_seconds: int = 300
+    ai_api_key: str = ""
+    ai_api_url: str = "https://api.siliconflow.cn/v1/"
+    ai_model: str = "deepseek-ai/DeepSeek-V3.2"
 
 
 def load_plugin_toml_config(config_path: Optional[Path] = None) -> PluginTomlConfig:
@@ -265,6 +271,7 @@ def load_plugin_toml_config(config_path: Optional[Path] = None) -> PluginTomlCon
 
     raw = _load_toml(path)
     section = raw.get("plugin", {})
+    ai_section = raw.get("ai", {})
 
     return PluginTomlConfig(
         internal_token=_opt_str(raw.get("internal_token"), PluginTomlConfig().internal_token),
@@ -275,6 +282,9 @@ def load_plugin_toml_config(config_path: Optional[Path] = None) -> PluginTomlCon
         short_id_ttl_seconds=int(_opt_str(
             section.get("short_id_ttl_seconds"), PluginTomlConfig().short_id_ttl_seconds,
         )),
+        ai_api_key=_opt_str(ai_section.get("api_key"), PluginTomlConfig().ai_api_key),
+        ai_api_url=_opt_str(ai_section.get("api_url"), PluginTomlConfig().ai_api_url),
+        ai_model=_opt_str(ai_section.get("model"), PluginTomlConfig().ai_model),
     )
 
 

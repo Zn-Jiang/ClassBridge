@@ -16,6 +16,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from shared.protocol import MessagePriority, MessageType
 
+from .ai_classifier import classify_message
 from .config import Config, merge_with_plugin_config
 from .messages import (
     HELP_TEXT,
@@ -37,6 +38,9 @@ __plugin_meta__ = PluginMetadata(
 
 config = merge_with_plugin_config(get_plugin_config(Config))
 message_handler = on_message(priority=5, block=False)
+# AI classifier runs before the main handler so it can intercept natural-language
+# messages that aren't @-mentions.
+ai_handler = on_message(priority=4, block=False)
 receipt_task: Optional[asyncio.Task] = None
 
 
@@ -44,10 +48,11 @@ receipt_task: Optional[asyncio.Task] = None
 async def _on_startup() -> None:
     global receipt_task
     logger.info(
-        "message_handler_plugin loaded. groups={} admins={} server={}",
+        "message_handler_plugin loaded. groups={} admins={} server={} ai_model={}",
         config.class_group_ids,
         config.admin_users,
         config.server_ws_url,
+        config.ai_model or "(disabled)",
     )
     receipt_task = asyncio.create_task(_receipt_loop())
 
@@ -60,6 +65,105 @@ async def _on_shutdown() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await receipt_task
         receipt_task = None
+
+
+# =========================================================================
+# AI intent classification handler (priority 4 — runs before the main handler)
+# =========================================================================
+
+
+@ai_handler.handle()
+async def handle_ai_classify(bot: Bot, event: MessageEvent) -> None:
+    """Auto-detect notification intent in non-admin group messages.
+
+    Parents can type naturally (e.g. "下午接孩子时帮带一本书") without
+    @-mentioning the bot.  The AI classifier decides whether the message
+    should be forwarded to the classroom client.
+    """
+    # Only applies to group messages (not private chat).
+    if not isinstance(event, GroupMessageEvent):
+        return
+
+    # Only for configured class groups.
+    if event.group_id not in set(config.class_group_ids):
+        return
+
+    # Skip messages from admins — they use explicit commands.
+    if event.user_id in set(config.admin_users):
+        return
+
+    # Skip @bot messages — the main handler already processes them.
+    if event.is_tome():
+        return
+
+    content = event.get_plaintext().strip()
+    if not content:
+        return
+
+    # Skip explicit slash commands (no point sending them to AI).
+    if content.startswith("/"):
+        return
+
+    logger.info(
+        "AI classify: user=%s group=%s content=%r",
+        event.user_id,
+        event.group_id,
+        content[:80],
+    )
+
+    is_notification = await classify_message(
+        content,
+        api_key=config.ai_api_key,
+        api_url=config.ai_api_url,
+        model=config.ai_model,
+    )
+
+    if not is_notification:
+        logger.info("AI classify: NOT a notification, skipping")
+        return
+
+    logger.info("AI classify: IS a notification, auto-forwarding")
+    await _auto_forward(bot, event, content)
+
+
+async def _auto_forward(bot: Bot, event: GroupMessageEvent, content: str) -> None:
+    """Forward a message that the AI classified as a notification."""
+    group_id = str(event.group_id)
+    try:
+        response = await send_request(
+            config,
+            MessageType.NEW_MESSAGE,
+            data={
+                "sender_id": str(event.user_id),
+                "sender_name": _sender_name(event),
+                "content": content,
+                "msg_type": MessagePriority.NORMAL.value,
+                "timestamp": current_timestamp_text(),
+                "group_id": group_id,
+                "source_message_id": getattr(event, "message_id", None),
+            },
+        )
+    except ServerApiError as exc:
+        await bot.send(
+            event,
+            MessageSegment.reply(event.message_id)
+            + MessageSegment.text(f" AI 自动转发失败：{exc}"),
+        )
+        return
+
+    # Use the same feedback logic as the manual dispatch path.
+    await bot.send(
+        event,
+        MessageSegment.reply(event.message_id)
+        + MessageSegment.text(
+            " " + build_store_feedback(response, MessagePriority.NORMAL)
+        ),
+    )
+
+
+# =========================================================================
+# Main message handler (priority 5 — @bot commands & explicit dispatch)
+# =========================================================================
 
 
 @message_handler.handle()

@@ -45,10 +45,14 @@ from qfluentwidgets import (
 from shared.config import ClientConfig, save_client_config
 from shared.protocol import ClientMode, MessageStatus
 
+from .classisland_monitor import ClassIslandMonitor
+from .database import ClientDatabase, message_to_cache_dict
 from .models import ClientMessage, ClientSnapshot
 from .ntp import TimeSyncResult, get_network_time
 from .schedule_loader import (
+    CLASSISLAND_SOURCE_KEY,
     ScheduleSource,
+    is_classisland_source,
     list_schedule_sources,
     load_schedule_break_ranges,
     resolve_schedule_source,
@@ -411,6 +415,7 @@ class MessageListPage(QWidget):
 
 class BreakMonitorThread(QThread):
     popup_requested = pyqtSignal(str, int)
+    break_state_changed = pyqtSignal(bool)  # True = in break, False = in class
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -423,6 +428,7 @@ class BreakMonitorThread(QThread):
         self._unread_revision = 0
         self._last_break_key: Optional[str] = None
         self._last_popup_revision = -1
+        self._last_in_break = False
 
     def stop(self) -> None:
         with self._lock:
@@ -456,10 +462,12 @@ class BreakMonitorThread(QThread):
                 unread_revision = self._unread_revision
                 last_break_key = self._last_break_key
                 last_popup_revision = self._last_popup_revision
+                last_in_break = self._last_in_break
 
             popup_break_key: Optional[str] = None
             popup_unread_count = 0
             current_break_key = self._current_break_key(schedule_ranges, sync_time, sync_anchor)
+            current_in_break = current_break_key is not None
 
             with self._lock:
                 if current_break_key is None:
@@ -475,6 +483,12 @@ class BreakMonitorThread(QThread):
                     self._last_popup_revision = unread_revision
                     popup_break_key = current_break_key
                     popup_unread_count = unread_count
+
+                if current_in_break != last_in_break:
+                    self._last_in_break = current_in_break
+
+            if current_in_break != last_in_break:
+                self.break_state_changed.emit(current_in_break)
 
             if popup_break_key is not None:
                 self.popup_requested.emit(popup_break_key, popup_unread_count)
@@ -828,6 +842,14 @@ class MainWindow(FluentWindow):
         self._foreground_restore_timer.timeout.connect(self._restore_transient_topmost)
         self._break_monitor = BreakMonitorThread(self)
         self._break_monitor.popup_requested.connect(self._on_break_popup_requested)
+        self._break_monitor.break_state_changed.connect(self._on_break_state_changed)
+
+        # Local SQLite cache (lives in %APPDATA%/ClassBridge/)
+        self._local_db = ClientDatabase()
+        self._local_db.open()
+
+        # ClassIsland real-time schedule monitor (started on demand)
+        self._classisland_monitor: Optional[ClassIslandMonitor] = None
 
         self.unread_page = MessageListPage("未读消息", show_read_button=True, on_mark_read=self._mark_read)
         self.history_page = MessageListPage("历史消息", show_read_button=False)
@@ -911,6 +933,139 @@ class MainWindow(FluentWindow):
             self._break_monitor.terminate()
             self._break_monitor.wait(1000)
 
+    # ------------------------------------------------------------------
+    # ClassIsland real-time schedule monitor
+    # ------------------------------------------------------------------
+
+    def _start_classisland_monitor(self) -> None:
+        """Launch (or restart) the ClassIsland WebSocket monitor."""
+        self._stop_classisland_monitor()
+        self._classisland_monitor = ClassIslandMonitor(
+            ws_url=self._config.classisland_ws_url,
+            parent=self,
+        )
+        self._classisland_monitor.break_started.connect(self._on_classisland_break_started)
+        self._classisland_monitor.class_started.connect(self._on_classisland_class_started)
+        self._classisland_monitor.connection_changed.connect(self._on_classisland_connection_changed)
+        self._classisland_monitor.error_occurred.connect(self._show_warning)
+        self._classisland_monitor.fallback_needed.connect(self._on_classisland_fallback_needed)
+        self._classisland_monitor.start()
+        logger.info(
+            "ClassIsland monitor started: %s",
+            self._config.classisland_ws_url,
+        )
+
+    def _stop_classisland_monitor(self) -> None:
+        """Stop the ClassIsland monitor if it is running."""
+        if self._classisland_monitor is None:
+            return
+        self._classisland_monitor.stop()
+        if not self._classisland_monitor.wait(3000):
+            self._classisland_monitor.terminate()
+            self._classisland_monitor.wait(1000)
+        self._classisland_monitor = None
+
+    def _on_classisland_break_started(self, next_subject: str) -> None:
+        """Called when ClassIsland signals the start of a break."""
+        logger.info(
+            "ClassIsland break started: next=%s active_window=%s visible=%s",
+            next_subject,
+            self.isActiveWindow(),
+            self.isVisible(),
+        )
+        self._push_break_state_to_worker(True)
+        self.show_normal(force_topmost=True, switch_to_unread=True)
+        unread_count = self._current_unread_count()
+        if unread_count > 0:
+            self._show_info(
+                f"课间休息（下节：{next_subject}），有 {unread_count} 条未读消息"
+            )
+        else:
+            self._show_info(f"课间休息（下节：{next_subject}）")
+
+    def _on_classisland_class_started(self) -> None:
+        """Called when ClassIsland signals the start of a class period."""
+        logger.info("ClassIsland: class started")
+        self._push_break_state_to_worker(False)
+
+    def _on_classisland_connection_changed(self, connected: bool, text: str) -> None:
+        """Update the window title with ClassIsland connection status."""
+        if connected:
+            logger.info("ClassIsland bridge connected")
+        else:
+            logger.warning("ClassIsland bridge disconnected: %s", text)
+
+    def _on_classisland_fallback_needed(self) -> None:
+        """Switch back to the best available JSON schedule after repeated
+        ClassIsland connection failures.  Shows a persistent error bar that
+        the user must manually dismiss."""
+        self._stop_classisland_monitor()
+
+        # Find the first working JSON schedule source.
+        fallback_source: Optional[ScheduleSource] = None
+        for source in self._schedule_sources:
+            if source.is_classisland:
+                continue
+            ranges, error = validate_schedule_file(source.path)
+            if ranges:
+                fallback_source = source
+                break
+
+        if fallback_source is not None:
+            self._schedule_source = fallback_source
+            self._schedule_ranges, _ = validate_schedule_file(fallback_source.path)
+            self._break_monitor.update_schedule_ranges(self._schedule_ranges)
+            self.settings_page.set_schedule_options(self._schedule_sources, fallback_source.key)
+            self._persist_schedule_selection(fallback_source.key, mark_valid=True)
+            logger.info(
+                "Fell back to JSON schedule: %s (%s)",
+                fallback_source.label,
+                fallback_source.key,
+            )
+
+        # Persistent error — stays until the user clicks the close button.
+        InfoBar.error(
+            title="ClassIsland 连接失败",
+            content=(
+                "ClassIsland 桥接器连续 5 次连接失败，已自动回退至 "
+                f"{fallback_source.label if fallback_source else 'JSON 时间表'}。"
+                "请检查 ClassIsland 及桥接器是否正常运行。"
+            ),
+            orient=Qt.Orientation.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=-1,  # never auto-close
+            parent=self,
+        )
+
+    # ------------------------------------------------------------------
+    # local SQLite cache
+    # ------------------------------------------------------------------
+
+    def _cache_snapshot_to_local_db(self, snapshot: ClientSnapshot) -> None:
+        """Write the current snapshot to the local SQLite cache."""
+        try:
+            all_messages = snapshot.unread_items + snapshot.history_items
+            # Deduplicate by db_id (unread takes priority over history).
+            seen: set[int] = set()
+            deduped: list = []
+            for msg in all_messages:
+                if msg.db_id in seen:
+                    continue
+                seen.add(msg.db_id)
+                deduped.append(message_to_cache_dict(msg))
+            self._local_db.cache_messages(deduped)
+        except Exception:
+            logger.exception("Failed to cache snapshot to local database")
+
+    def _load_cached_messages(self) -> List[Dict]:
+        """Return cached messages from the local database (newest first)."""
+        try:
+            return self._local_db.get_cached_messages()
+        except Exception:
+            logger.exception("Failed to load cached messages from local database")
+            return []
+
     def _reload_schedule_sources(self) -> None:
         self._schedule_sources = list_schedule_sources()
         selected, _, warning = self._select_working_schedule_source(
@@ -921,6 +1076,12 @@ class MainWindow(FluentWindow):
         self._schedule_source = selected
         self.settings_page.set_schedule_options(self._schedule_sources, selected.key if selected else None)
         self._break_monitor.update_schedule_ranges(self._schedule_ranges)
+
+        if is_classisland_source(selected):
+            self._start_classisland_monitor()
+        else:
+            self._stop_classisland_monitor()
+
         if selected is not None:
             self._persist_schedule_selection(selected.key, mark_valid=True)
         if warning:
@@ -936,6 +1097,12 @@ class MainWindow(FluentWindow):
         )
         self._schedule_source = selected
         self.settings_page.set_schedule_options(self._schedule_sources, selected.key if selected else None)
+
+        if is_classisland_source(selected):
+            self._start_classisland_monitor()
+        else:
+            self._stop_classisland_monitor()
+
         if requested is not None and selected is not None and requested.key != selected.key:
             self._show_warning(
                 self._format_schedule_fallback_warning(
@@ -976,6 +1143,12 @@ class MainWindow(FluentWindow):
             source = source_by_key.get(key)
             if source is None:
                 continue
+
+            # ClassIsland is always valid — it provides live events.
+            if is_classisland_source(source):
+                self._schedule_ranges = []
+                return source, requested, None
+
             ranges, error = validate_schedule_file(source.path)
             if ranges:
                 self._schedule_ranges = ranges
@@ -1066,6 +1239,9 @@ class MainWindow(FluentWindow):
         self.settings_page.set_exam_mode(snapshot.mode == ClientMode.EXAM)
         self._update_window_title(snapshot.is_online, snapshot.mode)
 
+        # Persist to local SQLite cache for offline resilience.
+        self._cache_snapshot_to_local_db(snapshot)
+
         for message in snapshot.unread_items:
             if (
                 message.is_urgent
@@ -1117,6 +1293,16 @@ class MainWindow(FluentWindow):
         if self._notified_break_key != break_key:
             self._notified_break_key = break_key
             self._show_info(f"课间休息，有 {unread_count} 条未读消息")
+
+    def _on_break_state_changed(self, in_break: bool) -> None:
+        """Push the latest break state to the WebSocket worker so the server
+        knows whether the client is currently in class or on break."""
+        self._push_break_state_to_worker(in_break)
+
+    def _push_break_state_to_worker(self, in_break: bool) -> None:
+        """Notify the server of the current class/break status."""
+        if self._worker is not None:
+            self._worker.set_is_in_break(in_break)
 
     def _apply_settling_reads(self, snapshot: ClientSnapshot) -> ClientSnapshot:
         if not self._settling_read_ids:
@@ -1397,7 +1583,9 @@ class MainWindow(FluentWindow):
             timer.stop()
         self._reminder_timers.clear()
         self._stop_break_monitor()
+        self._stop_classisland_monitor()
         self._stop_worker()
+        self._local_db.close()
         self.tray.hide()
         self._force_close = True
         self.close()

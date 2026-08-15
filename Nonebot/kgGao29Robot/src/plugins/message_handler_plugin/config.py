@@ -25,6 +25,11 @@ class Config(BaseModel):
     admin_users: List[int] = Field(default_factory=list)
     short_id_ttl_seconds: int = 300
 
+    # AI intent classification (DeepSeek official API)
+    ai_api_key: str = ""
+    ai_api_url: str = "https://api.deepseek.com/beta"
+    ai_model: str = "deepseek-v4-flash"
+
 
 def merge_with_plugin_config(runtime_config: Config) -> Config:
     """Use NoneBot runtime config first, then fall back to configs/plugin.toml."""
@@ -41,6 +46,9 @@ def merge_with_plugin_config(runtime_config: Config) -> Config:
             "short_id_ttl_seconds": _prefer_int(
                 runtime_config.short_id_ttl_seconds, plugin.short_id_ttl_seconds
             ),
+            "ai_api_key": _prefer_str(runtime_config.ai_api_key, plugin.ai_api_key, sentinel=""),
+            "ai_api_url": _prefer_str(runtime_config.ai_api_url, plugin.ai_api_url, sentinel=""),
+            "ai_model": _prefer_str(runtime_config.ai_model, plugin.ai_model, sentinel=""),
         }
     )
     return merged
@@ -59,3 +67,9 @@ def _prefer_list(current: List[int], fallback: List[int]) -> List[int]:
 def _prefer_int(current: int, fallback: int) -> int:
     return current if current != 300 else fallback
 
+
+def _prefer_str(current: str, fallback: str, sentinel: str = "") -> str:
+    """Return *current* if non-empty and different from *sentinel*, else *fallback*."""
+    if current and current != sentinel:
+        return current
+    return fallback

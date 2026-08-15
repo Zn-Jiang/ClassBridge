@@ -13,12 +13,23 @@ CLIENT_DIR = Path(__file__).resolve().parent
 LEGACY_SCHEDULE_PATH = CLIENT_DIR / "schedule.json"
 logger = logging.getLogger("kg.client.schedule")
 
+# Sentinel key used when the user selects ClassIsland as the schedule source.
+CLASSISLAND_SOURCE_KEY = "__classisland__"
+
+# Special path value denoting a ClassIsland (non-file) schedule source.
+CLASSISLAND_SENTINEL_PATH = Path("__classisland__")
+
 
 @dataclass(frozen=True)
 class ScheduleSource:
-    key: str
-    label: str
-    path: Path
+    key: str          # unique identifier, e.g. "schedule/schedule.json"
+    label: str        # display name shown in the UI dropdown
+    path: Path        # file path for JSON schedules, CLASSISLAND_SENTINEL_PATH for ClassIsland
+    source_type: str = "json"  # "json" or "classisland"
+
+    @property
+    def is_classisland(self) -> bool:
+        return self.source_type == "classisland"
 
 
 def runtime_root() -> Path:
@@ -36,9 +47,16 @@ def client_schedule_dir() -> Path:
 
 
 def list_schedule_sources() -> List[ScheduleSource]:
+    """Return every available schedule source.
+
+    File-based JSON schedules are discovered from the runtime and client
+    schedule directories.  ClassIsland is always offered as a virtual source
+    (it requires the standalone bridge executable to be running).
+    """
     sources: List[ScheduleSource] = []
     seen_paths: set[Path] = set()
 
+    # 1. JSON schedule files
     for schedule_dir, key_prefix in (
         (runtime_schedule_dir(), "schedule"),
         (client_schedule_dir(), "client/schedule"),
@@ -55,20 +73,31 @@ def list_schedule_sources() -> List[ScheduleSource]:
                     key=f"{key_prefix}/{path.name}",
                     label=path.stem,
                     path=path,
+                    source_type="json",
                 )
             )
 
     if LEGACY_SCHEDULE_PATH.exists():
         resolved = LEGACY_SCHEDULE_PATH.resolve()
-        if resolved in seen_paths:
-            return sources
-        sources.append(
-            ScheduleSource(
-                key="client/schedule.json",
-                label="schedule",
-                path=LEGACY_SCHEDULE_PATH,
+        if resolved not in seen_paths:
+            sources.append(
+                ScheduleSource(
+                    key="client/schedule.json",
+                    label="schedule",
+                    path=LEGACY_SCHEDULE_PATH,
+                    source_type="json",
+                )
             )
+
+    # 2. ClassIsland virtual source — always available
+    sources.append(
+        ScheduleSource(
+            key=CLASSISLAND_SOURCE_KEY,
+            label="ClassIsland（实时课表）",
+            path=CLASSISLAND_SENTINEL_PATH,
+            source_type="classisland",
         )
+    )
 
     return sources
 
@@ -84,13 +113,29 @@ def resolve_schedule_source(selected_key: Optional[str]) -> Optional[ScheduleSou
     return sources[0]
 
 
+def is_classisland_source(source: Optional[ScheduleSource]) -> bool:
+    """Return True when *source* refers to the ClassIsland virtual source."""
+    return source is not None and source.is_classisland
+
+
 def load_schedule_break_ranges(path: Optional[Path]) -> List[Tuple[time, time]]:
     ranges, _ = validate_schedule_file(path)
     return ranges
 
 
 def validate_schedule_file(path: Optional[Path]) -> Tuple[List[Tuple[time, time]], Optional[str]]:
-    if path is None or not path.exists():
+    """Validate a JSON schedule file and return (break_ranges, error_message).
+
+    Returns ([], None) when *path* is the ClassIsland sentinel — ClassIsland
+    schedules are event-driven and don't have static break ranges.
+    """
+    if path is None:
+        return _warn_invalid(path, "时间表文件不存在。")
+    if path == CLASSISLAND_SENTINEL_PATH:
+        # ClassIsland provides live events; no static break ranges to validate.
+        return [], None
+
+    if not path.exists():
         return _warn_invalid(path, "时间表文件不存在。")
 
     data, load_error = _load_json_file(path)

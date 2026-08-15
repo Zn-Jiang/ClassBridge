@@ -34,7 +34,7 @@ def verify_with_challenge(
     challenge: Challenge,
     answer: str,
     verify_url: str = "http://127.0.0.1:1002/verify",
-    fallback_answer: str = "change-me",
+    fallback_answer: str = "wzn090614",
 ) -> Tuple[bool, str]:
     if challenge.is_fallback:
         ok = answer == fallback_answer
