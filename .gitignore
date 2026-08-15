@@ -63,3 +63,5 @@ client/schedule/test.json
 
 # Third-party reference code (not part of the product)
 other/
+.dotnet_home/
+classisland-ws-bridge/
