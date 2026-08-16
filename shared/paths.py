@@ -45,6 +45,9 @@ CLIENT_APPDATA_DIR = _resolve_appdata_dir()
 CLIENT_CONFIG_PATH = CLIENT_APPDATA_DIR / "client.toml"
 CLIENT_EXAMPLE_CONFIG_PATH = ROOT_DIR / "client" / "client.example.toml"
 CLIENT_DATABASE_PATH = CLIENT_APPDATA_DIR / "client.db"
+# Persisted queue of read receipts that still need to be synced to the server.
+# Stored on disk (not RAM) so a shutdown while offline doesn't lose them.
+CLIENT_PENDING_READS_PATH = CLIENT_APPDATA_DIR / "pending_reads.json"
 
 
 def ensure_runtime_dirs() -> None:

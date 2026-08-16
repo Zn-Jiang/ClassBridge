@@ -189,11 +189,22 @@ class ServerService:
         if db_id is None:
             return self._error_response("mark_read requires db_id", request_id)
 
+        current = self._database.get_message(db_id)
+        if current is None:
+            return self._error_response("message not found", request_id)
+
+        # Idempotency guard: the client may replay a read receipt after a
+        # reconnect (offline queue).  Only enqueue the QQ-group receipt the
+        # first time a message transitions into READ — otherwise parents get
+        # duplicated receipts.
+        was_already_read = current.status == MessageStatus.READ
+
         message = self._database.mark_message_read(db_id)
         if message is None:
             return self._error_response("message not found", request_id)
 
-        self._database.enqueue_read_receipt(message, "[回执] 您的消息已被学生读取。")
+        if not was_already_read:
+            self._database.enqueue_read_receipt(message, "[回执] 您的消息已被学生读取。")
         return envelope_to_dict(
             make_envelope(
                 MessageType.READ_RECEIPT,

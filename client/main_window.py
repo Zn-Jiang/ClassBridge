@@ -49,6 +49,7 @@ from .classisland_monitor import ClassIslandMonitor
 from .database import ClientDatabase, message_to_cache_dict
 from .models import ClientMessage, ClientSnapshot
 from .ntp import TimeSyncResult, get_network_time
+from .pending_reads import PendingReadsStore
 from .schedule_loader import (
     CLASSISLAND_SOURCE_KEY,
     ScheduleSource,
@@ -832,6 +833,9 @@ class MainWindow(FluentWindow):
         self._reminder_timers: Dict[int, QTimer] = {}
         self._pending_read_ids: Set[int] = set()
         self._settling_read_ids: Set[int] = set()
+        # Disk-backed queue of read receipts awaiting sync — survives shutdown
+        # while offline, so no read is lost when the machine is powered off.
+        self._pending_reads = PendingReadsStore()
         self._queued_urgent_ids: List[int] = []
         self._active_urgent_db_id: Optional[int] = None
         self._active_urgent_dialog: Optional[UrgentMessageDialog] = None
@@ -1189,12 +1193,29 @@ class MainWindow(FluentWindow):
             return
         self._pending_read_ids.add(db_id)
         self.unread_page.set_pending_read_ids(self._pending_read_ids)
+        # Persist to disk BEFORE handing off to the worker so that a shutdown
+        # while offline (or a crashed send) never loses the read receipt.
+        self._pending_reads.add(db_id)
+        self._enqueue_read_sync(db_id)
+
+    def _enqueue_read_sync(self, db_id: int) -> None:
+        """Try to send a read receipt now; it stays in the disk queue until
+        the server confirms (removed in _on_read_completed)."""
         if self._worker is not None:
             self._worker.mark_read(db_id)
-            return
-        self._pending_read_ids.discard(db_id)
+
+    def _flush_pending_reads(self) -> None:
+        """Replay every read receipt persisted while offline, oldest first.
+
+        Called when the WebSocket reconnects.  Idempotent: items already
+        in-flight are skipped via ``_pending_read_ids``.
+        """
+        for db_id in self._pending_reads.all():
+            if db_id in self._pending_read_ids:
+                continue
+            self._pending_read_ids.add(db_id)
+            self._enqueue_read_sync(db_id)
         self.unread_page.set_pending_read_ids(self._pending_read_ids)
-        self._show_warning("客户端未连接，无法同步已读。")
 
     def _set_exam_mode(self, enabled: bool) -> None:
         if self._worker is not None:
@@ -1226,6 +1247,10 @@ class MainWindow(FluentWindow):
         mode = self._snapshot.mode if self._snapshot else ClientMode.NORMAL
         self._update_window_title(connected, mode)
         self.tray.setToolTip(f"家校沟通客户端 - {text}")
+        if connected:
+            # Reconnect succeeded — replay any read receipts persisted while
+            # the link was down.
+            self._flush_pending_reads()
 
     def _on_snapshot_received(self, snapshot: ClientSnapshot) -> None:
         previous_unread_map = {item.db_id: item for item in self._snapshot.unread_items} if self._snapshot else {}
@@ -1237,7 +1262,12 @@ class MainWindow(FluentWindow):
         self.unread_page.set_pending_read_ids(self._pending_read_ids)
         self.history_page.set_messages(snapshot.history_items)
         self.settings_page.set_exam_mode(snapshot.mode == ClientMode.EXAM)
-        self._update_window_title(snapshot.is_online, snapshot.mode)
+        # Title reflects the *local* WebSocket state, not the server-side
+        # is_online flag: the latter can be stale (e.g. a previous connection's
+        # close handler marked us offline right after a reconnect), which is
+        # what made the client look "dead" while still receiving messages.
+        connected = self._last_connected_state if self._last_connected_state is not None else snapshot.is_online
+        self._update_window_title(connected, snapshot.mode)
 
         # Persist to local SQLite cache for offline resilience.
         self._cache_snapshot_to_local_db(snapshot)
@@ -1348,6 +1378,8 @@ class MainWindow(FluentWindow):
 
     def _on_read_completed(self, db_id: int) -> None:
         self._pending_read_ids.discard(db_id)
+        # Server confirmed — drop it from the persisted queue for good.
+        self._pending_reads.discard(db_id)
         self._settling_read_ids.add(db_id)
         self.unread_page.set_pending_read_ids(self._pending_read_ids)
         self._clear_urgent_state(db_id)
@@ -1355,6 +1387,9 @@ class MainWindow(FluentWindow):
 
     def _on_read_failed(self, db_id: int, text: str) -> None:
         self._pending_read_ids.discard(db_id)
+        # The server answered but rejected the receipt (e.g. message already
+        # gone).  Keeping it would loop forever, so drop it and warn instead.
+        self._pending_reads.discard(db_id)
         self.unread_page.set_pending_read_ids(self._pending_read_ids)
         self._show_warning(text)
 

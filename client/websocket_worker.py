@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from queue import Empty, Queue
 from typing import Any, Dict
 
@@ -11,6 +12,11 @@ from shared.config import ClientConfig
 from shared.protocol import ClientMode, MessageType, envelope_to_json, make_envelope, parse_envelope_json
 
 from .models import snapshot_from_payload
+
+# How long a request/response round-trip may take before we treat the
+# connection as dead.  Guards against WinError 121 (semaphore timeout) hangs
+# on Windows where an idle recv() can stall forever instead of erroring.
+_RESPONSE_TIMEOUT_SECONDS = 15.0
 
 
 class ClientWorker(QThread):
@@ -47,6 +53,12 @@ class ClientWorker(QThread):
         self._commands.put({"type": "snapshot"})
 
     def run(self) -> None:
+        # On Windows, the default ProactorEventLoop has known issues with
+        # websockets where an idle connection raises WinError 121
+        # ("semaphore timeout period has expired") and the client goes into a
+        # fake-offline state.  SelectorEventLoop avoids those hangs.
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(self._main())
 
     async def _main(self) -> None:
@@ -57,7 +69,13 @@ class ClientWorker(QThread):
         while self._running:
             try:
                 self.connection_changed.emit(False, "正在连接服务器...")
-                async with websockets.connect(ws_url, max_size=2**20) as websocket:
+                async with websockets.connect(
+                    ws_url,
+                    max_size=2**20,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                ) as websocket:
                     self.connection_changed.emit(True, "已连接")
                     delay = self._config.reconnect_initial_delay_seconds
                     await self._send_status_update(websocket, True)
@@ -148,7 +166,11 @@ class ClientWorker(QThread):
             auth_token=self._config.internal_token,
         )
         await websocket.send(envelope_to_json(envelope))
-        return parse_envelope_json(await websocket.recv())
+        # Guard against a stalled recv() (WinError 121 / half-open TCP on
+        # Windows).  If the server does not answer in time, treat the
+        # connection as broken so the outer loop reconnects cleanly.
+        raw = await asyncio.wait_for(websocket.recv(), timeout=_RESPONSE_TIMEOUT_SECONDS)
+        return parse_envelope_json(raw)
 
     def _current_mode(self) -> ClientMode:
         return ClientMode.EXAM if self._exam_mode else ClientMode.NORMAL

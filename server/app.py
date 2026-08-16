@@ -27,6 +27,12 @@ class ServerApplication:
         self.database = Database(self.config)
         self.short_ids = ShortIdStore()
         self.service = ServerService(self.config, self.database, self.short_ids)
+        # The currently-active client WebSocket connection.  Only the connection
+        # that is still active when it closes is allowed to mark the client
+        # offline — a stale connection whose ``finally`` runs after a reconnect
+        # must NOT overwrite the new connection's online status (the classic
+        # "client looks offline but still receives messages" race).
+        self._active_client_ws: Optional[WebSocketServerProtocol] = None
 
     def initialize(self) -> None:
         self.database.initialize()
@@ -68,6 +74,10 @@ class ServerApplication:
                     response = self.service.handle_plugin_request(envelope.type, envelope.data, envelope.request_id)
                 elif path == self.config.client_ws_path:
                     client_name = str(envelope.data.get("client_name") or self.config.client_name)
+                    # Mark this connection as the active client connection as
+                    # soon as we see a valid authenticated message on it, so
+                    # that a stale connection can never mark us offline later.
+                    self._active_client_ws = websocket
                     response = self.service.handle_client_request(envelope.type, envelope.data, envelope.request_id)
                 else:
                     response = self.service._error_response(
@@ -83,7 +93,12 @@ class ServerApplication:
             with contextlib.suppress(Exception):
                 await websocket.send(_json_response(self.service._error_response("Server internal error.", None)))
         finally:
-            if path == self.config.client_ws_path:
+            if path == self.config.client_ws_path and self._active_client_ws is websocket:
+                # Only the connection that is *currently* the active client may
+                # mark the client offline.  If a newer connection already took
+                # over (client reconnected), this stale connection must not
+                # clobber its online status.
+                self._active_client_ws = None
                 self.service.mark_client_offline(client_name)
 
     def smoke_test(self) -> int:
