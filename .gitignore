@@ -54,9 +54,10 @@ Nonebot/appsettings.json
 .DS_Store
 Thumbs.db
 
-# Claude Code
+# Vibe Coding
 .claude/
 HANDOFF.md
+.dsh/
 
 #client
 client/schedule/test.json
