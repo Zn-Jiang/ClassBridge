@@ -11,4 +11,4 @@ short_id_ttl_seconds = 300
 # Get your API key from https://platform.deepseek.com/
 api_key = "sk-your-key-here"
 api_url = "https://api.deepseek.com/beta"
-model = "deepseek-v4-flash"
+model = "deepseek-flash"

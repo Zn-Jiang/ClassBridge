@@ -13,7 +13,9 @@ HELP_TEXT = """可用指令：
 /重发 短ID
 
 发送消息（在群内）：
-@机器人 记得带雨伞"""
+@机器人 记得带雨伞
+
+提示：执行 /查询 后，在短 ID 有效期内可直接发送"撤回 短ID"或"重发 短ID"，无需 @机器人。"""
 
 
 def parse_user_input(text: str) -> Dict[str, Optional[str]]:
@@ -66,7 +68,7 @@ def build_query_feedback(payload: Dict[str, Any]) -> str:
         lines.append(
             f"[{item.get('short_id')}] {label} | {item.get('timestamp')} | {item.get('content_preview')}"
         )
-    lines.append("可使用：/撤回 短ID 或 /重发 短ID")
+    lines.append("可回复 撤回 短ID 或 重发 短ID（无需 @机器人），也可使用 /撤回 或 /重发")
     return "\n".join(lines)
 
 

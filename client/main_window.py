@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLineEdit,
     QMenu,
+    QStackedWidget,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -34,9 +35,12 @@ from qfluentwidgets import (
     InfoBar,
     InfoBarPosition,
     LineEdit,
+    MessageBox,
     PrimaryPushButton,
     PushButton,
+    RadioButton,
     ScrollArea,
+    SegmentedWidget,
     SpinBox,
     SubtitleLabel,
     MessageBoxBase,
@@ -45,11 +49,16 @@ from qfluentwidgets import (
 from shared.config import ClientConfig, save_client_config
 from shared.protocol import ClientMode, MessageStatus
 
+from .ci_watchdog import CiProcessWatcher
+from .cib_supervisor import CibSupervisor
 from .classisland_monitor import ClassIslandMonitor
 from .database import ClientDatabase, message_to_cache_dict
+from .import_wizard import ScheduleImportWizard
 from .models import ClientMessage, ClientSnapshot
 from .ntp import TimeSyncResult, get_network_time
 from .pending_reads import PendingReadsStore
+from .schedule_store import ScheduleStore, StoredSchedule
+from . import cib_daemon
 from .schedule_loader import (
     CLASSISLAND_SOURCE_KEY,
     ScheduleSource,
@@ -645,6 +654,16 @@ class UrgentMessageDialog(MessageBoxBase):
 
 
 class SettingsPage(QWidget):
+    """设置页。
+
+    内部用 ``SegmentedWidget`` + ``QStackedWidget`` 分成两个子页，方便后续
+    继续追加子页面：
+
+    - **通知时机**：时间表来源模式（CI 优先 / 仅本地）、下课弹窗延时、
+      ClassIsland 课表导入。
+    - **通用设置**：考试模式、服务器地址、NTP 校时、历史消息保留。
+    """
+
     def __init__(
         self,
         config: ClientConfig,
@@ -655,6 +674,9 @@ class SettingsPage(QWidget):
         on_retention_changed: Callable[[int], None],
         on_schedule_source_changed: Callable[[str], None],
         on_reload_schedules: Callable[[], None],
+        on_schedule_mode_changed: Callable[[str], None],
+        on_break_delay_changed: Callable[[int], None],
+        on_import_schedule: Callable[[], None],
     ) -> None:
         super().__init__()
         self._config = config
@@ -664,14 +686,123 @@ class SettingsPage(QWidget):
         self._on_retention_changed = on_retention_changed
         self._on_schedule_source_changed = on_schedule_source_changed
         self._on_reload_schedules = on_reload_schedules
+        self._on_schedule_mode_changed = on_schedule_mode_changed
+        self._on_break_delay_changed = on_break_delay_changed
+        self._on_import_schedule = on_import_schedule
         self.setObjectName("settings_page")
         self._build_ui()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(18)
+        layout.setSpacing(16)
         layout.addWidget(SubtitleLabel("设置"))
+
+        # 子页切换结构（后续新增子页只需再加一个 item + 一个 widget）
+        self.pivot = SegmentedWidget(self)
+        self.stack = QStackedWidget(self)
+        self.timing_page = self._build_timing_page()
+        self.general_page = self._build_general_page()
+        self.stack.addWidget(self.timing_page)
+        self.stack.addWidget(self.general_page)
+
+        self.pivot.addItem(routeKey="timing", text="通知时机", onClick=lambda: self._switch_page(0))
+        self.pivot.addItem(routeKey="general", text="通用设置", onClick=lambda: self._switch_page(1))
+        self.pivot.setCurrentItem("timing")
+        self._switch_page(0)
+
+        layout.addWidget(self.pivot)
+        layout.addWidget(self.stack, 1)
+
+    def _switch_page(self, index: int) -> None:
+        self.stack.setCurrentIndex(index)
+
+    # -- 通知时机子页 ------------------------------------------------------
+
+    def _build_timing_page(self) -> QWidget:
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(12)
+
+        # 1) 时间表来源：二选一
+        layout.addWidget(BodyLabel("时间表来源"))
+        self.ci_mode_radio = RadioButton(
+            "优先 ClassIsland 联动（未运行或连接失败时自动降级本地课表）"
+        )
+        self.local_mode_radio = RadioButton("仅使用 CBC 本地课表")
+        layout.addWidget(self.ci_mode_radio)
+        layout.addWidget(self.local_mode_radio)
+
+        if str(self._config.schedule_mode).lower() == "local":
+            self.local_mode_radio.setChecked(True)
+        else:
+            self.ci_mode_radio.setChecked(True)
+        self.ci_mode_radio.toggled.connect(self._change_schedule_mode)
+
+        self.schedule_mode_hint = CaptionLabel("")
+        self.schedule_mode_hint.setWordWrap(True)
+        layout.addWidget(self.schedule_mode_hint)
+        self._refresh_schedule_mode_hint()
+
+        # 2) 本地课表（ClassIsland 导入）
+        layout.addWidget(BodyLabel("本地课表"))
+        self.import_button = PrimaryPushButton("从 ClassIsland 配置文件导入课表")
+        self.import_button.clicked.connect(lambda: self._on_import_schedule())
+        self.local_schedule_label = CaptionLabel("尚未导入本地课表")
+        self.local_schedule_label.setWordWrap(True)
+        import_row = QHBoxLayout()
+        import_row.addWidget(self.import_button)
+        import_row.addWidget(self.local_schedule_label, 1)
+        layout.addLayout(import_row)
+
+        # 3) 下课延时
+        layout.addWidget(BodyLabel("下课弹窗延时"))
+        self.delay_spin = SpinBox()
+        self.delay_spin.setRange(0, 300)
+        self.delay_spin.setValue(int(self._config.break_popup_delay_seconds))
+        self.delay_spin.setEnabled(True)
+        self.delay_spin.valueChanged.connect(self._change_break_delay)
+        layout.addWidget(
+            _field_row("下课延时", self.delay_spin, CaptionLabel("秒（0 = 下课立即弹窗）"))
+        )
+
+        # 4) 本地 JSON 时间表文件（作为降级/本地模式的兜底数据源）
+        self.schedule_box = ComboBox()
+        self.schedule_box.currentTextChanged.connect(self._change_schedule_source)
+        self.schedule_refresh_button = PushButton("刷新时间表列表")
+        self.schedule_refresh_button.clicked.connect(lambda: self._on_reload_schedules())
+        layout.addWidget(
+            _field_row("降级用 JSON 时间表文件", self.schedule_box, self.schedule_refresh_button)
+        )
+        schedule_hint = CaptionLabel(
+            "仅在上方选择“仅使用 CBC 本地课表”、或 ClassIsland 不可用降级时使用；"
+            "已导入的课表优先于此文件。"
+        )
+        schedule_hint.setWordWrap(True)
+        layout.addWidget(schedule_hint)
+
+        layout.addStretch(1)
+        return page
+
+    def _refresh_schedule_mode_hint(self) -> None:
+        if self.ci_mode_radio.isChecked():
+            self.schedule_mode_hint.setText(
+                "运行时后台检测 ClassIsland.Desktop.exe：进程不存在或桥接器连续失败时，"
+                "自动改用上方导入的本地课表触发课间弹窗。"
+            )
+        else:
+            self.schedule_mode_hint.setText(
+                "始终使用本地保存的课表，不连接 ClassIsland（适合未安装 ClassIsland 的教室）。"
+            )
+
+    # -- 通用设置子页 ------------------------------------------------------
+
+    def _build_general_page(self) -> QWidget:
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(12)
 
         self.exam_checkbox = QCheckBox("考试模式")
         self.exam_checkbox.stateChanged.connect(
@@ -719,12 +850,6 @@ class SettingsPage(QWidget):
         self.sync_button = PushButton("立即校时")
         layout.addWidget(self.sync_button)
 
-        self.schedule_box = ComboBox()
-        self.schedule_box.currentTextChanged.connect(self._change_schedule_source)
-        self.schedule_refresh_button = PushButton("刷新时间表列表")
-        self.schedule_refresh_button.clicked.connect(self._on_reload_schedules)
-        layout.addWidget(_field_row("时间表来源", self.schedule_box, self.schedule_refresh_button))
-
         self.retention_box = ComboBox()
         for label in RETENTION_OPTIONS:
             self.retention_box.addItem(label)
@@ -733,11 +858,52 @@ class SettingsPage(QWidget):
         layout.addWidget(_field_row("历史消息保留", self.retention_box))
 
         layout.addStretch(1)
+        return page
 
     def set_exam_mode(self, enabled: bool) -> None:
         self.exam_checkbox.blockSignals(True)
         self.exam_checkbox.setChecked(enabled)
         self.exam_checkbox.blockSignals(False)
+
+    def _change_schedule_mode(self, _checked: bool) -> None:
+        mode = "local" if self.local_mode_radio.isChecked() else "auto"
+        self._refresh_schedule_mode_hint()
+        self._on_schedule_mode_changed(mode)
+
+    def _change_break_delay(self, value: int) -> None:
+        self._on_break_delay_changed(int(value))
+
+    def set_schedule_mode(self, mode: str) -> None:
+        """Reflect the persisted schedule mode without re-emitting signals.
+
+        All buttons are blocked first: ``QRadioButton`` auto-exclusivity makes
+        checking one button *uncheck* its sibling, which would otherwise fire
+        the callback while its sibling's signals were already unblocked.
+        """
+        target = self.local_mode_radio if str(mode).lower() == "local" else self.ci_mode_radio
+        buttons = (self.ci_mode_radio, self.local_mode_radio)
+        for button in buttons:
+            button.blockSignals(True)
+        for button in buttons:
+            button.setChecked(button is target)
+        for button in buttons:
+            button.blockSignals(False)
+        self._refresh_schedule_mode_hint()
+
+    def set_local_schedule_summary(self, schedule: Optional[StoredSchedule]) -> None:
+        """Show which local timetable is stored (or that none is)."""
+        if schedule is None or schedule.is_empty:
+            self.local_schedule_label.setText("尚未导入本地课表（ClassIsland 不可用时将无法弹窗）")
+            self.local_schedule_label.setTextColor("#c42b1c", "#c42b1c")
+            return
+        imported = f"导入于 {schedule.imported_at}" if schedule.imported_at else "已导入"
+        self.local_schedule_label.setText(f"已导入：{schedule.describe()}，{imported}")
+        self.local_schedule_label.setTextColor("#0f766e", "#4cc2ff")
+
+    def set_break_popup_delay(self, seconds: int) -> None:
+        self.delay_spin.blockSignals(True)
+        self.delay_spin.setValue(int(seconds))
+        self.delay_spin.blockSignals(False)
 
     def set_schedule_options(self, sources: List[ScheduleSource], current_key: Optional[str]) -> None:
         self.schedule_box.blockSignals(True)
@@ -854,6 +1020,22 @@ class MainWindow(FluentWindow):
 
         # ClassIsland real-time schedule monitor (started on demand)
         self._classisland_monitor: Optional[ClassIslandMonitor] = None
+        # Locally persisted timetable — the fallback source when ClassIsland
+        # is missing, and the sole source in "local" mode.
+        self._schedule_store = ScheduleStore()
+        # ClassIsland process watchdog (started by _start_ci_watchdog)
+        self._ci_watchdog: Optional[CiProcessWatcher] = None
+        self._ci_alive: Optional[bool] = None
+        # CIB (ClassIsland.WSBridge) supervision state.
+        #   None = not checked yet, True = usable, False = known unavailable
+        self._cib_ready: Optional[bool] = None
+        self._cib_supervisor: Optional[CibSupervisor] = None
+        self._cib_degrade_announced = False
+        # Deferred break popup (下课延时弹窗)
+        self._break_popup_timer = QTimer(self)
+        self._break_popup_timer.setSingleShot(True)
+        self._break_popup_timer.timeout.connect(self._show_deferred_break_popup)
+        self._deferred_break_popup: Optional[Tuple[str, int]] = None
 
         self.unread_page = MessageListPage("未读消息", show_read_button=True, on_mark_read=self._mark_read)
         self.history_page = MessageListPage("历史消息", show_read_button=False)
@@ -865,14 +1047,19 @@ class MainWindow(FluentWindow):
             on_retention_changed=self._change_history_retention,
             on_schedule_source_changed=self._change_schedule_source,
             on_reload_schedules=self._reload_schedule_sources,
+            on_schedule_mode_changed=self._change_schedule_mode,
+            on_break_delay_changed=self._change_break_delay,
+            on_import_schedule=self._import_schedule_from_classisland,
         )
 
         self._init_window()
         self._init_tray()
+        self.settings_page.set_local_schedule_summary(self._schedule_store.current())
         self._reload_schedule_sources()
         self._start_worker()
         self._sync_time()
         self._break_monitor.start()
+        self._start_ci_watchdog()
 
     def _init_window(self) -> None:
         self.resize(1080, 760)
@@ -969,6 +1156,292 @@ class MainWindow(FluentWindow):
             self._classisland_monitor.wait(1000)
         self._classisland_monitor = None
 
+    # ------------------------------------------------------------------
+    # ClassIsland 存活检测 + 课表降级
+    # ------------------------------------------------------------------
+
+    def _start_ci_watchdog(self) -> None:
+        """Start the background ClassIsland process watchdog."""
+        if self._ci_watchdog is not None:
+            return
+        watchdog = CiProcessWatcher(parent=self)
+        watchdog.alive_changed.connect(self._on_ci_alive_changed)
+        # Prime the state synchronously so we don't have to wait for the first
+        # poll to know whether ClassIsland is around.
+        try:
+            self._ci_alive = watchdog.check_alive()
+        except Exception:
+            logger.exception("ClassIsland watchdog priming failed")
+            self._ci_alive = None
+        self._ci_watchdog = watchdog
+        watchdog.start()
+        logger.info("ClassIsland watchdog started (alive=%s)", self._ci_alive)
+        # Apply right away: the first watchdog emit would be swallowed by the
+        # "state unchanged" guard, so a missing ClassIsland must degrade here.
+        if self._ci_alive is not None:
+            self._apply_schedule_mode()
+
+    def _stop_ci_watchdog(self) -> None:
+        if self._ci_watchdog is None:
+            return
+        self._ci_watchdog.stop()
+        if not self._ci_watchdog.wait(3000):
+            self._ci_watchdog.terminate()
+            self._ci_watchdog.wait(1000)
+        self._ci_watchdog = None
+
+    def _stop_cib_supervisor(self) -> None:
+        """Stop a pending CIB check (its confirmation prompt is auto-declined)."""
+        supervisor = self._cib_supervisor
+        if supervisor is None:
+            return
+        if supervisor.isRunning():
+            # Unblock any pending confirmation wait so the thread can finish.
+            supervisor.provide_confirmation(False)
+            if not supervisor.wait(3000):
+                supervisor.terminate()
+                supervisor.wait(1000)
+        self._cib_supervisor = None
+
+    def _on_ci_alive_changed(self, alive: bool) -> None:
+        """ClassIsland appeared/disappeared — re-evaluate the schedule source."""
+        if self._ci_alive == alive:
+            return
+        self._ci_alive = alive
+        logger.info("ClassIsland process alive=%s", alive)
+        if str(self._config.schedule_mode).lower() == "local":
+            return
+        # Re-evaluate the bridge: ClassIsland may have restarted, or CIB may
+        # now be launchable again.
+        self._cib_ready = None
+        self._cib_degrade_announced = False
+        reason = (
+            "ClassIsland 已启动，恢复实时联动"
+            if alive
+            else "检测到 ClassIsland 未运行，已自动降级为本地课表"
+        )
+        self._apply_schedule_mode(announce=True, reason=reason)
+
+    def _apply_schedule_mode(self, *, announce: bool = False, reason: str = "") -> None:
+        """Single entry point deciding between CI events and a local timetable.
+
+        Priority:
+
+        1. ``local`` mode → always the locally saved timetable.
+        2. ClassIsland process known to be missing → local timetable.
+        3. Otherwise → live ClassIsland events (via the CIB bridge), which
+           themselves fall back to the local timetable if CIB is unavailable.
+
+        The "本地 JSON 时间表文件" dropdown only selects *which* file backs the
+        local timetable (used by ``local`` mode or by a degradation); it never
+        overrides the mode the user picked.
+        """
+        mode = str(self._config.schedule_mode).lower()
+
+        if mode == "local":
+            use_ci = False
+            ranges, detail = self._local_fallback_ranges()
+            reason = reason or "仅使用本地课表"
+        elif self._ci_alive is False:
+            use_ci = False
+            ranges, detail = self._local_fallback_ranges()
+            reason = reason or "ClassIsland 未运行，已自动降级为本地课表"
+        else:
+            use_ci = True
+            ranges = []
+            detail = "ClassIsland 实时联动"
+
+        self._schedule_ranges = list(ranges)
+        self._break_monitor.update_schedule_ranges(self._schedule_ranges)
+
+        if use_ci:
+            # Live events need the CIB bridge up; that check runs in the
+            # background and falls back to the local timetable when it fails.
+            self._start_cib_then_monitor()
+        else:
+            self._stop_classisland_monitor()
+
+        logger.info(
+            "Schedule source applied: mode=%s use_ci=%s ranges=%s detail=%s",
+            mode,
+            use_ci,
+            len(self._schedule_ranges),
+            detail,
+        )
+        if announce:
+            self._announce_schedule_source(
+                use_ci=use_ci, detail=detail, ranges=self._schedule_ranges, reason=reason
+            )
+
+    # ------------------------------------------------------------------
+    # CIB (ClassIsland.WSBridge) supervision
+    # ------------------------------------------------------------------
+
+    def _start_cib_then_monitor(self) -> None:
+        """Enable live ClassIsland events once CIB is verified/launched."""
+        if self._cib_ready is False:
+            # Already known to be unavailable — stay degraded.
+            self._degrade_to_local_schedule()
+            return
+
+        if self._cib_ready is True:
+            self._start_classisland_monitor()
+            return
+
+        if self._cib_supervisor is not None and self._cib_supervisor.isRunning():
+            logger.debug("CIB supervision already in progress")
+            return
+
+        logger.info("Checking ClassIsland bridge (CIB) availability")
+        supervisor = CibSupervisor(exe_path=self._config.cib_exe_path or None, parent=self)
+        supervisor.confirm_kill_requested.connect(self._on_cib_confirm_kill)
+        supervisor.completed.connect(self._on_cib_supervisor_finished)
+        self._cib_supervisor = supervisor
+        supervisor.start()
+
+    def _on_cib_confirm_kill(self, process_name: str, pid: int) -> None:
+        """Ask the user whether the process holding port 6614 may be killed."""
+        text = (
+            f"端口 {cib_daemon.CIB_PORT} 目前被进程 [{process_name} (PID: {pid})] 占用，"
+            "是否强制结束该进程以启动 ClassIsland 桥接器？"
+        )
+        logger.warning("Port %s conflict: %s (PID %s)", cib_daemon.CIB_PORT, process_name, pid)
+        try:
+            box = MessageBox("端口占用", text, self)
+            approved = box.exec() == QDialog.DialogCode.Accepted
+        except Exception:
+            logger.exception("Failed to show the port-conflict dialog; refusing")
+            approved = False
+
+        supervisor = self._cib_supervisor
+        if supervisor is not None:
+            supervisor.provide_confirmation(approved)
+
+    def _on_cib_supervisor_finished(self, result) -> None:
+        """Handle the CIB check result: enable live events or degrade."""
+        self._cib_supervisor = None
+
+        if result is not None and result.ok:
+            self._cib_ready = True
+            logger.info("CIB ready: %s", result.message)
+            self._start_classisland_monitor()
+            return
+
+        self._cib_ready = False
+        message = result.message if result is not None else "ClassIsland 桥接器不可用。"
+        logger.warning("CIB unavailable: %s", message)
+
+        if not self._cib_degrade_announced:
+            self._cib_degrade_announced = True
+            if isinstance(result, cib_daemon.CibEnsureResult):
+                self._show_warning(cib_daemon.describe_degradation(result))
+            else:
+                self._show_warning(f"{message} 已降级为本地静态课表模式。")
+
+        self._degrade_to_local_schedule()
+
+    def _degrade_to_local_schedule(self) -> None:
+        """Use the locally stored timetable without changing the saved mode."""
+        self._stop_classisland_monitor()
+        ranges, detail = self._local_fallback_ranges()
+        self._schedule_ranges = list(ranges)
+        self._break_monitor.update_schedule_ranges(self._schedule_ranges)
+        logger.info("Degraded to local timetable: %s (%s breaks)", detail, len(self._schedule_ranges))
+
+    def _local_fallback_ranges(self) -> Tuple[List[Tuple], str]:
+        """Break ranges for local operation.
+
+        Prefers the timetable imported from ClassIsland and falls back to an
+        explicitly selected JSON schedule file.
+        """
+        if self._schedule_store.has_schedule:
+            schedule = self._schedule_store.current()
+            return (
+                self._schedule_store.break_ranges(),
+                schedule.describe() if schedule is not None else "本地课表",
+            )
+        source = self._schedule_source
+        if source is not None and not source.is_classisland:
+            ranges, _ = validate_schedule_file(source.path)
+            if ranges:
+                return ranges, source.label
+        return [], "无可用课表"
+
+    def _announce_schedule_source(
+        self,
+        *,
+        use_ci: bool,
+        detail: str,
+        ranges: List[Tuple],
+        reason: str,
+    ) -> None:
+        """Show the user which schedule source is now active."""
+        if use_ci and not reason:
+            return
+        if use_ci:
+            message = f"{reason}（课表来源：ClassIsland 实时联动）"
+        elif ranges:
+            message = f"{reason}（课表来源：{detail}，共 {len(ranges)} 个课间）"
+        else:
+            message = f"{reason}，但未找到可用课表，请先在“设置 → 通知时机”中导入课表。"
+        InfoBar.info(
+            title="课表来源",
+            content=message,
+            orient=Qt.Orientation.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP_RIGHT,
+            duration=6000,
+            parent=self,
+        )
+
+    def _change_schedule_mode(self, mode: str) -> None:
+        mode = "local" if str(mode).lower() == "local" else "auto"
+        if self._config.schedule_mode == mode:
+            return
+        self._config.schedule_mode = mode
+        save_client_config(self._config)
+        logger.info("Schedule mode changed to %s", mode)
+        self._apply_schedule_mode(announce=True)
+
+    def _change_break_delay(self, seconds: int) -> None:
+        seconds = max(0, int(seconds))
+        if self._config.break_popup_delay_seconds == seconds:
+            return
+        self._config.break_popup_delay_seconds = seconds
+        save_client_config(self._config)
+        logger.info("Break popup delay set to %ss", seconds)
+
+        # A popup may be waiting on the *old* delay — re-apply it with the new
+        # value so it can never fire at a stale moment.
+        pending = self._deferred_break_popup
+        if pending is not None and self._break_popup_timer.isActive():
+            self._break_popup_timer.stop()
+            if seconds <= 0:
+                self._deferred_break_popup = None
+                self._show_break_popup(*pending)
+            else:
+                self._break_popup_timer.start(seconds * 1000)
+
+    def _import_schedule_from_classisland(self) -> None:
+        """Open the 3-step import wizard and persist the chosen timetable."""
+        wizard = ScheduleImportWizard(parent=self)
+        if wizard.exec() != QDialog.DialogCode.Accepted:
+            logger.info("ClassIsland schedule import cancelled by user")
+            return
+
+        schedule = wizard.imported_schedule
+        if schedule is None:
+            return
+
+        self._schedule_store.save(schedule)
+        self.settings_page.set_local_schedule_summary(schedule)
+        logger.info("Imported local schedule: %s", schedule.describe())
+
+        if self._ci_alive is False or str(self._config.schedule_mode).lower() == "local":
+            self._apply_schedule_mode(announce=True, reason="本地课表已更新")
+        else:
+            self._show_info(f"课表已导入：{schedule.describe()}")
+
     def _on_classisland_break_started(self, next_subject: str) -> None:
         """Called when ClassIsland signals the start of a break."""
         logger.info(
@@ -1000,12 +1473,33 @@ class MainWindow(FluentWindow):
             logger.warning("ClassIsland bridge disconnected: %s", text)
 
     def _on_classisland_fallback_needed(self) -> None:
-        """Switch back to the best available JSON schedule after repeated
-        ClassIsland connection failures.  Shows a persistent error bar that
-        the user must manually dismiss."""
+        """ClassIsland events are unusable — fall back to a local timetable.
+
+        The imported timetable is preferred; if none was imported we keep the
+        previous behaviour of switching to the first usable JSON schedule
+        file.  Shows a persistent error bar the user must dismiss."""
         self._stop_classisland_monitor()
 
-        # Find the first working JSON schedule source.
+        local_ranges, detail = self._local_fallback_ranges()
+        if local_ranges:
+            self._schedule_ranges = local_ranges
+            self._break_monitor.update_schedule_ranges(local_ranges)
+            logger.info("Fell back to local timetable: %s", detail)
+            InfoBar.error(
+                title="ClassIsland 连接失败",
+                content=(
+                    f"ClassIsland 桥接器连续 5 次连接失败，已自动回退至 {detail}"
+                    f"（{len(local_ranges)} 个课间）。请检查 ClassIsland 及桥接器是否正常运行。"
+                ),
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                position=InfoBarPosition.TOP_RIGHT,
+                duration=-1,  # never auto-close
+                parent=self,
+            )
+            return
+
+        # No imported timetable — find the first working JSON schedule source.
         fallback_source: Optional[ScheduleSource] = None
         for source in self._schedule_sources:
             if source.is_classisland:
@@ -1079,12 +1573,10 @@ class MainWindow(FluentWindow):
         )
         self._schedule_source = selected
         self.settings_page.set_schedule_options(self._schedule_sources, selected.key if selected else None)
-        self._break_monitor.update_schedule_ranges(self._schedule_ranges)
+        self.settings_page.set_local_schedule_summary(self._schedule_store.current())
 
-        if is_classisland_source(selected):
-            self._start_classisland_monitor()
-        else:
-            self._stop_classisland_monitor()
+        # The mode + ClassIsland liveness decide what is actually used.
+        self._apply_schedule_mode()
 
         if selected is not None:
             self._persist_schedule_selection(selected.key, mark_valid=True)
@@ -1102,10 +1594,7 @@ class MainWindow(FluentWindow):
         self._schedule_source = selected
         self.settings_page.set_schedule_options(self._schedule_sources, selected.key if selected else None)
 
-        if is_classisland_source(selected):
-            self._start_classisland_monitor()
-        else:
-            self._stop_classisland_monitor()
+        self._apply_schedule_mode()
 
         if requested is not None and selected is not None and requested.key != selected.key:
             self._show_warning(
@@ -1310,9 +1799,26 @@ class MainWindow(FluentWindow):
             self._break_unread_revision += 1
         self._break_monitor.update_unread_state(unread_count, self._break_unread_revision)
 
+    def _show_deferred_break_popup(self) -> None:
+        pending = self._deferred_break_popup
+        self._deferred_break_popup = None
+        if pending is None:
+            return
+        self._show_break_popup(*pending)
+
     def _on_break_popup_requested(self, break_key: str, unread_count: int) -> None:
+        """Break detected — honour the configured popup delay, then show it."""
+        delay_seconds = max(0, int(self._config.break_popup_delay_seconds))
+        if delay_seconds > 0:
+            self._deferred_break_popup = (break_key, unread_count)
+            self._break_popup_timer.start(delay_seconds * 1000)
+            logger.info("Break popup deferred by %ss (break=%s)", delay_seconds, break_key)
+            return
+        self._show_break_popup(break_key, unread_count)
+
+    def _show_break_popup(self, break_key: str, unread_count: int) -> None:
         logger.info(
-            "Break monitor requested popup: break=%s unread_count=%s active_window=%s visible=%s minimized=%s",
+            "Break popup: break=%s unread_count=%s active_window=%s visible=%s minimized=%s",
             break_key,
             unread_count,
             self.isActiveWindow(),
@@ -1328,6 +1834,11 @@ class MainWindow(FluentWindow):
         """Push the latest break state to the WebSocket worker so the server
         knows whether the client is currently in class or on break."""
         self._push_break_state_to_worker(in_break)
+        if not in_break and self._break_popup_timer.isActive():
+            # The break ended before the deferred popup fired — drop it.
+            self._break_popup_timer.stop()
+            self._deferred_break_popup = None
+            logger.info("Deferred break popup cancelled: break already ended")
 
     def _push_break_state_to_worker(self, in_break: bool) -> None:
         """Notify the server of the current class/break status."""
@@ -1617,7 +2128,10 @@ class MainWindow(FluentWindow):
         for timer in self._reminder_timers.values():
             timer.stop()
         self._reminder_timers.clear()
+        self._break_popup_timer.stop()
         self._stop_break_monitor()
+        self._stop_cib_supervisor()
+        self._stop_ci_watchdog()
         self._stop_classisland_monitor()
         self._stop_worker()
         self._local_db.close()

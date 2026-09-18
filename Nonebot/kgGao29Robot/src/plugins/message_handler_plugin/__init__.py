@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import sys
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from nonebot import get_bots, get_driver, get_plugin_config, logger, on_message
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageEvent, MessageSegment, PrivateMessageEvent
@@ -16,7 +18,11 @@ if str(ROOT_DIR) not in sys.path:
 
 from shared.protocol import MessagePriority, MessageType
 
-from .ai_classifier import classify_message
+from .ai_classifier import (
+    classify_message,
+    configure as configure_ai_classifier,
+    warmup_connection,
+)
 from .config import Config, merge_with_plugin_config
 from .messages import (
     HELP_TEXT,
@@ -43,6 +49,43 @@ message_handler = on_message(priority=5, block=False)
 ai_handler = on_message(priority=4, block=False)
 receipt_task: Optional[asyncio.Task] = None
 
+# ---------------------------------------------------------------------------
+# 免@命令（free-form commands）：
+# 用户执行过 /查询 后，在短 ID 有效期内可直接发送自然语言执行命令，
+# 无需 @机器人。注册表为可扩展列表：每项 (正则, 处理器)。
+# 处理器签名：async (bot, event, arg) -> None，其中 arg 为正则第 1 个捕获组。
+# 新增免@命令时只需在 FREE_COMMAND_SPECS 里追加一项即可。
+# ---------------------------------------------------------------------------
+# user_id -> 查询会话过期时间（time.monotonic() 时间戳）
+_query_sessions: Dict[int, float] = {}
+
+
+def _record_query_session(user_id: int, ttl_seconds: int) -> None:
+    """Record that *user_id* has an active query session for *ttl_seconds*."""
+    _query_sessions[user_id] = time.monotonic() + ttl_seconds
+
+
+def _has_active_query_session(user_id: int) -> bool:
+    """Return True while the user's short IDs are still valid."""
+    expires_at = _query_sessions.get(user_id)
+    if expires_at is None:
+        return False
+    if time.monotonic() > expires_at:
+        _query_sessions.pop(user_id, None)
+        return False
+    return True
+
+
+async def _try_free_command(bot: Bot, event: GroupMessageEvent, content: str) -> bool:
+    """Try to run a free-form (no-@) command; return True if one matched."""
+    for pattern, handler in FREE_COMMAND_SPECS:
+        match = pattern.match(content)
+        if match:
+            logger.info("Free command: user=%s content=%r", event.user_id, content[:60])
+            await handler(bot, event, match.group(1))
+            return True
+    return False
+
 
 @get_driver().on_startup
 async def _on_startup() -> None:
@@ -54,6 +97,14 @@ async def _on_startup() -> None:
         config.server_ws_url,
         config.ai_model or "(disabled)",
     )
+    # Inject the AI configuration once, then warm the HTTP connection so the
+    # first parent message doesn't pay for DNS/TLS.
+    configure_ai_classifier(
+        api_key=config.ai_api_key,
+        base_url=config.ai_api_url,
+        model=config.ai_model,
+    )
+    asyncio.create_task(warmup_connection())
     receipt_task = asyncio.create_task(_receipt_loop())
 
 
@@ -79,6 +130,10 @@ async def handle_ai_classify(bot: Bot, event: MessageEvent) -> None:
     Parents can type naturally (e.g. "下午接孩子时帮带一本书") without
     @-mentioning the bot.  The AI classifier decides whether the message
     should be forwarded to the classroom client.
+
+    Rule-matching runs BEFORE the AI call to save tokens: users who recently
+    ran /查询 may issue free-form (no-@) commands such as "撤回 1" / "重发 2";
+    anything that matches is handled locally and never reaches the AI.
     """
     # Only applies to group messages (not private chat).
     if not isinstance(event, GroupMessageEvent):
@@ -88,7 +143,7 @@ async def handle_ai_classify(bot: Bot, event: MessageEvent) -> None:
     if event.group_id not in set(config.class_group_ids):
         return
 
-    # Skip messages from admins — they use explicit commands.
+    # Skip messages from admins — they use explicit @bot commands, never AI.
     if event.user_id in set(config.admin_users):
         return
 
@@ -99,6 +154,12 @@ async def handle_ai_classify(bot: Bot, event: MessageEvent) -> None:
     content = event.get_plaintext().strip()
     if not content:
         return
+
+    # 1) Rule matching first (no token cost): free-form commands for users
+    #    whose short IDs are still valid after a /查询.
+    if _has_active_query_session(event.user_id):
+        if await _try_free_command(bot, event, content):
+            return
 
     # Skip explicit slash commands (no point sending them to AI).
     if content.startswith("/"):
@@ -111,12 +172,8 @@ async def handle_ai_classify(bot: Bot, event: MessageEvent) -> None:
         content[:80],
     )
 
-    is_notification = await classify_message(
-        content,
-        api_key=config.ai_api_key,
-        api_url=config.ai_api_url,
-        model=config.ai_model,
-    )
+    # The classifier uses the module-level client configured at start-up.
+    is_notification = await classify_message(content)
 
     if not is_notification:
         logger.info("AI classify: NOT a notification, skipping")
@@ -246,6 +303,15 @@ async def _handle_query(bot: Bot, event: MessageEvent) -> None:
         return
     await _reply(bot, event, build_query_feedback(response))
 
+    # Remember the query session so this user can run free-form commands
+    # (e.g. "撤回 1") without @-mentioning the bot while the short IDs live.
+    try:
+        ttl_seconds = int(response.get("expires_in_seconds", 300))
+    except (TypeError, ValueError):
+        ttl_seconds = 300
+    _record_query_session(event.user_id, ttl_seconds)
+    logger.info("Query session recorded for user=%s ttl=%ss", event.user_id, ttl_seconds)
+
 
 async def _handle_recall(bot: Bot, event: MessageEvent, short_id: str) -> None:
     if not short_id:
@@ -330,3 +396,15 @@ def _is_self_message(event: MessageEvent) -> bool:
         return int(event.user_id) == int(event.self_id)
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# 免@命令注册表（定义在末尾，避免模块加载时的前向引用）：
+# 每项 (正则, 处理器)，处理器签名 async (bot, event, arg) -> None，
+# arg 为正则第 1 个捕获组。\s+ 允许空格；^\/? 兼容用户手滑带上斜杠。
+# 新增免@命令时只需在此追加一项即可。
+# ---------------------------------------------------------------------------
+FREE_COMMAND_SPECS = [
+    (re.compile(r"^\/?\s*撤回\s*(\d+)\s*$"), _handle_recall),
+    (re.compile(r"^\/?\s*重发\s*(\d+)\s*$"), _handle_resend),
+]

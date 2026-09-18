@@ -117,6 +117,14 @@ class ClientConfig:
     client_name: str = "classroom-desktop"
     schedule_source: Optional[str] = None
     last_valid_schedule_source: Optional[str] = None
+    # "auto"  = prefer live ClassIsland events, fall back to the local timetable
+    #           when ClassIsland is not running;
+    # "local" = only ever use the locally saved timetable.
+    schedule_mode: str = "auto"
+    # Seconds to wait after a break starts before showing the popup.
+    break_popup_delay_seconds: int = 0
+    # Optional explicit path to ClassIsland.WSBridge.exe (empty = auto-detect).
+    cib_exe_path: str = ""
     classisland_ws_url: str = "ws://localhost:6614/status"
     ntp_server: str = "ntp.aliyun.com"
     auto_popup_on_break: bool = True
@@ -138,6 +146,11 @@ class ClientConfig:
 
     def break_time_ranges(self) -> List[Tuple[time, time]]:
         return [item.as_time_range() for item in self.schedule_breaks]
+
+    @property
+    def prefers_classisland(self) -> bool:
+        """True when live ClassIsland events should be preferred."""
+        return self.schedule_mode != "local"
 
 
 def load_client_config(config_path: Optional[Path] = None) -> ClientConfig:
@@ -166,6 +179,11 @@ def load_client_config(config_path: Optional[Path] = None) -> ClientConfig:
         client_name=_opt_str(section.get("client_name"), ClientConfig().client_name),
         schedule_source=_none_if_empty(section.get("schedule_source")),
         last_valid_schedule_source=_none_if_empty(section.get("last_valid_schedule_source")),
+        schedule_mode=_opt_str(section.get("schedule_mode"), ClientConfig().schedule_mode),
+        break_popup_delay_seconds=int(_opt_str(
+            section.get("break_popup_delay_seconds"), ClientConfig().break_popup_delay_seconds,
+        )),
+        cib_exe_path=_opt_str(section.get("cib_exe_path"), ClientConfig().cib_exe_path),
         classisland_ws_url=_opt_str(section.get("classisland_ws_url"), ClientConfig().classisland_ws_url),
         ntp_server=_opt_str(section.get("ntp_server"), ClientConfig().ntp_server),
         auto_popup_on_break=bool(section.get("auto_popup_on_break", ClientConfig().auto_popup_on_break)),
@@ -211,6 +229,9 @@ def _dump_client_toml(config: ClientConfig) -> str:
     if config.last_valid_schedule_source:
         lines.append(f'last_valid_schedule_source = "{_esc(config.last_valid_schedule_source)}"')
     lines.extend([
+        f'schedule_mode = "{_esc(config.schedule_mode)}"',
+        f"break_popup_delay_seconds = {config.break_popup_delay_seconds}",
+        f'cib_exe_path = "{_esc(config.cib_exe_path)}"',
         f'classisland_ws_url = "{_esc(config.classisland_ws_url)}"',
         f'ntp_server = "{_esc(config.ntp_server)}"',
         f"auto_popup_on_break = {_bool_str(config.auto_popup_on_break)}",
@@ -260,8 +281,8 @@ class PluginTomlConfig:
     admin_users: List[int] = field(default_factory=list)
     short_id_ttl_seconds: int = 300
     ai_api_key: str = ""
-    ai_api_url: str = "https://api.siliconflow.cn/v1/"
-    ai_model: str = "deepseek-ai/DeepSeek-V3.2"
+    ai_api_url: str = "https://api.deepseek.com/beta"
+    ai_model: str = "deepseek-flash"
 
 
 def load_plugin_toml_config(config_path: Optional[Path] = None) -> PluginTomlConfig:

@@ -28,7 +28,7 @@ class Config(BaseModel):
     # AI intent classification (DeepSeek official API)
     ai_api_key: str = ""
     ai_api_url: str = "https://api.deepseek.com/beta"
-    ai_model: str = "deepseek-v4-flash"
+    ai_model: str = "deepseek-flash"
 
 
 def merge_with_plugin_config(runtime_config: Config) -> Config:

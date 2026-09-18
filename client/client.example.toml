@@ -7,6 +7,16 @@ client_name = "classroom-desktop"
 # schedule_source = "schedule/schedule.json"    # uncomment to pin a JSON schedule
 # schedule_source = "__classisland__"            # or use ClassIsland real-time events
 # last_valid_schedule_source = "schedule/schedule.json"
+
+# "auto"  = prefer live ClassIsland events; fall back to the locally imported
+#           timetable when ClassIsland.Desktop.exe is not running
+# "local" = only ever use the locally imported timetable
+schedule_mode = "auto"
+# Seconds to wait after a break starts before showing the popup (0 = immediate)
+break_popup_delay_seconds = 0
+# Optional explicit path to the ClassIsland.WSBridge.exe bridge.
+# Leave empty to auto-detect: <project>/bin/, then sys._MEIPASS/bin/ (frozen).
+cib_exe_path = ""
 classisland_ws_url = "ws://localhost:6614/status"
 ntp_server = "ntp.aliyun.com"
 auto_popup_on_break = true
