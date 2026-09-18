@@ -62,6 +62,10 @@ HANDOFF.md
 #client
 client/schedule/test.json
 
+# Bundled ClassIsland bridge binary (~68MB, built from classisland-ws-bridge/)
+# and any other packaged client binaries — deploy by copying, not via git.
+client/bin/
+
 # Third-party reference code (not part of the product)
 other/
 .dotnet_home/
