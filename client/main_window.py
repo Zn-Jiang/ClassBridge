@@ -1293,7 +1293,11 @@ class MainWindow(FluentWindow):
             return
 
         logger.info("Checking ClassIsland bridge (CIB) availability")
-        supervisor = CibSupervisor(exe_path=self._config.cib_exe_path or None, parent=self)
+        supervisor = CibSupervisor(
+            exe_path=self._config.cib_exe_path or None,
+            url=self._config.classisland_ws_url,
+            parent=self,
+        )
         supervisor.confirm_kill_requested.connect(self._on_cib_confirm_kill)
         supervisor.completed.connect(self._on_cib_supervisor_finished)
         self._cib_supervisor = supervisor

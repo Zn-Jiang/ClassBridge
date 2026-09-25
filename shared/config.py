@@ -125,7 +125,7 @@ class ClientConfig:
     break_popup_delay_seconds: int = 0
     # Optional explicit path to ClassIsland.WSBridge.exe (empty = auto-detect).
     cib_exe_path: str = ""
-    classisland_ws_url: str = "ws://localhost:6614/status"
+    classisland_ws_url: str = "ws://localhost:6614/"
     ntp_server: str = "ntp.aliyun.com"
     auto_popup_on_break: bool = True
     close_to_tray: bool = True

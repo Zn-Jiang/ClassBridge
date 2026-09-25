@@ -47,11 +47,13 @@ class CibSupervisor(QThread):
         *,
         exe_path: Optional[str] = None,
         port: int = cib_daemon.CIB_PORT,
+        url: str = cib_daemon.CIB_WS_URL,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._exe_path = exe_path
         self._port = port
+        self._url = url
         self._confirm_event = threading.Event()
         self._confirm_result = False
 
@@ -85,6 +87,7 @@ class CibSupervisor(QThread):
             confirm_kill_callback=self._request_confirmation,
             exe_path=self._exe_path,
             port=self._port,
+            url=self._url,
         )
 
     async def _request_confirmation(self, process_name: str, pid: int) -> bool:
