@@ -30,9 +30,12 @@ data/*
 *.swp
 *.swo
 
-# Per-component config files with secrets (templates are committed)
-server/server.toml
+# Config files with secrets (templates are committed: *.example.toml)
+config.toml
 client/client.toml
+# legacy per-component configs (superseded by config.toml, kept ignored in case
+# an older checkout still has them)
+server/server.toml
 Nonebot/kgGao29Robot/plugin.toml
 
 # NapCat QQ framework (large binaries, external dependency)
@@ -70,3 +73,5 @@ client/bin/
 other/
 .dotnet_home/
 classisland-ws-bridge/
+sync_to_server
+admin
