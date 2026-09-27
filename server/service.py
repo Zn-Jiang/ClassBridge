@@ -24,6 +24,15 @@ class ServerService:
         self._database = database
         self._short_ids = short_ids
 
+    def update_config(self, config: ServerConfig) -> None:
+        """Hot-reload the settings this service reads on every request.
+
+        ``internal_token``, ``short_id_ttl_seconds`` and the client name apply
+        immediately; listen addresses/database path need a restart (the caller
+        logs a warning for those).
+        """
+        self._config = config
+
     def handle_plugin_request(self, message_type: str, data: Dict[str, Any], request_id: Optional[str]):
         if message_type == MessageType.NEW_MESSAGE.value:
             return self._handle_new_message(data, request_id)

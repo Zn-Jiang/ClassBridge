@@ -10,4 +10,8 @@ ntplib>=0.4,<1.0
 psutil>=5.9,<7.0
 tomli>=2.0,<3.0; python_version < "3.11"
 openai>=1.0,<2.0
+# Admin console API (server/message_server.py): Flask + CORS for the
+# single-file console in admin/admin.html
+Flask>=2.2
+Flask-Cors>=4.0
 

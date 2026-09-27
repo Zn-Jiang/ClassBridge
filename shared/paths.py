@@ -34,11 +34,17 @@ DATA_DIR = ROOT_DIR / "data"
 NONEBOT_DIR = ROOT_DIR / "Nonebot" / "kgGao29Robot"
 PLUGIN_DIR = NONEBOT_DIR / "src" / "plugins" / "message_handler_plugin"
 
-# Per-component config paths (each lives inside its own module directory)
+# Per-component config paths (legacy — kept for backward-compatible fallback)
 SERVER_CONFIG_PATH = ROOT_DIR / "server" / "server.toml"
 SERVER_EXAMPLE_CONFIG_PATH = ROOT_DIR / "server" / "server.example.toml"
 PLUGIN_CONFIG_PATH = NONEBOT_DIR / "plugin.toml"
 PLUGIN_EXAMPLE_CONFIG_PATH = NONEBOT_DIR / "plugin.example.toml"
+
+# Unified configuration shared by server + plugin (see shared/config_manager.py).
+CONFIG_PATH = ROOT_DIR / "config.toml"
+CONFIG_EXAMPLE_PATH = ROOT_DIR / "config.example.toml"
+# Admin console (single-file HTML, opened directly in a browser).
+ADMIN_HTML_PATH = ROOT_DIR / "admin" / "admin.html"
 
 # Client data lives in the per-user appdata directory (Windows convention).
 CLIENT_APPDATA_DIR = _resolve_appdata_dir()

@@ -4,12 +4,17 @@ from datetime import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import logging
+
 from .paths import (
     CLIENT_CONFIG_PATH,
     CLIENT_EXAMPLE_CONFIG_PATH,
+    CONFIG_PATH,
     PLUGIN_CONFIG_PATH,
     SERVER_CONFIG_PATH,
 )
+
+logger = logging.getLogger("kg.config")
 
 # ---------------------------------------------------------------------------
 # TOML loader (stdlib tomllib on 3.11+, tomli on older)
@@ -37,6 +42,49 @@ class ScheduleBreak:
         return (_parse_clock_time(self.start), _parse_clock_time(self.end))
 
 
+def load_unified_config() -> Optional[Dict[str, Any]]:
+    """Return the merged unified configuration, or ``None`` when unavailable.
+
+    Thin wrapper around :mod:`shared.config_manager` so other modules stay
+    agnostic about *where* the configuration comes from.
+    """
+    try:
+        from .config_manager import get_config_manager
+
+        manager = get_config_manager()
+        if not manager.exists:
+            return None
+        return manager.get_current_config()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("读取统一配置 %s 失败：%s", CONFIG_PATH, exc)
+        return None
+
+
+def derive_plugin_ws_url(unified: Dict[str, Any]) -> str:
+    """Derive the plugin's WebSocket URL from the unified config.
+
+    ``[plugin].server_ws_url`` wins when present; otherwise the URL is built
+    from the active environment's host/port (a wildcard listen address such as
+    ``0.0.0.0`` is replaced by ``127.0.0.1`` because the plugin runs on the same
+    machine as the server).
+    """
+    plugin_section = unified.get("plugin") if isinstance(unified.get("plugin"), dict) else {}
+    configured = _none_if_empty(plugin_section.get("server_ws_url"))
+    if configured:
+        return configured
+
+    server_section = unified.get("server") if isinstance(unified.get("server"), dict) else {}
+    host = str(unified.get("server_host") or "127.0.0.1").strip()
+    if host in {"", "0.0.0.0", "::", "*"}:
+        host = "127.0.0.1"
+    try:
+        port = int(unified.get("server_port") or 8765)
+    except (TypeError, ValueError):
+        port = 8765
+    path = _norm_ws(server_section.get("plugin_ws_path", "") or "/ws/plugin")
+    return f"ws://{host}:{port}{path}"
+
+
 # ===========================================================================
 # Server config
 # ===========================================================================
@@ -55,13 +103,37 @@ class ServerConfig:
     plugin_ws_path: str = "/ws/plugin"
     client_name: str = "classroom-desktop"
     short_id_ttl_seconds: int = 300
+    # --- provided by the unified config.toml -----------------------------
+    active_env: str = "dev"
+    debug_mode: bool = False
+    admin_host: str = "127.0.0.1"
+    admin_port: int = 8766
+    admin_secret_token: str = ""
 
 
 def load_server_config(config_path: Optional[Path] = None) -> ServerConfig:
+    """Load the message-server settings.
+
+    Prefers the unified ``config.toml`` (with the active environment already
+    applied).  A legacy ``server.toml`` is only consulted when *config_path* is
+    passed explicitly or no unified file exists, so old deployments keep
+    working while everything migrates.
+    """
+    if config_path is None:
+        unified = load_unified_config()
+        if unified is not None:
+            return _server_config_from_unified(unified)
+
+    # --- legacy path (explicit argument or missing config.toml) ----------
     path = _resolve_path(config_path, SERVER_CONFIG_ENV_VAR, SERVER_CONFIG_PATH)
     if not path.exists():
+        if config_path is None:
+            logger.warning(
+                "未找到 %s 且不存在旧版 server.toml，使用默认服务端配置。", CONFIG_PATH
+            )
         return ServerConfig()
 
+    logger.info("使用旧版配置文件 %s（建议迁移到统一的 config.toml）", path)
     raw = _load_toml(path)
     section = raw.get("server", {})
 
@@ -75,6 +147,28 @@ def load_server_config(config_path: Optional[Path] = None) -> ServerConfig:
         plugin_ws_path=_norm_ws(section.get("plugin_ws_path", "")),
         client_name=_opt_str(section.get("client_name"), ServerConfig().client_name),
         short_id_ttl_seconds=int(_opt_str(section.get("short_id_ttl_seconds"), ServerConfig().short_id_ttl_seconds)),
+    )
+
+
+def _server_config_from_unified(unified: Dict[str, Any]) -> ServerConfig:
+    """Build :class:`ServerConfig` from the flattened unified config."""
+    defaults = ServerConfig()
+    section = unified.get("server") if isinstance(unified.get("server"), dict) else {}
+    return ServerConfig(
+        internal_token=_opt_str(unified.get("internal_token"), defaults.internal_token),
+        host=_opt_str(unified.get("server_host"), defaults.host),
+        port=int(unified.get("server_port") or defaults.port),
+        database_path=_opt_str(section.get("database_path"), defaults.database_path),
+        log_level=_opt_str(section.get("log_level"), defaults.log_level),
+        client_ws_path=_norm_ws(section.get("client_ws_path", "")),
+        plugin_ws_path=_norm_ws(section.get("plugin_ws_path", "")),
+        client_name=_opt_str(section.get("client_name"), defaults.client_name),
+        short_id_ttl_seconds=int(unified.get("short_id_ttl_seconds") or defaults.short_id_ttl_seconds),
+        active_env=_opt_str(unified.get("active_env"), defaults.active_env),
+        debug_mode=bool(unified.get("debug_mode", defaults.debug_mode)),
+        admin_host=_opt_str(section.get("admin_host"), defaults.admin_host),
+        admin_port=int(section.get("admin_port") or defaults.admin_port),
+        admin_secret_token=_opt_str(unified.get("admin_secret_token"), defaults.admin_secret_token),
     )
 
 
@@ -280,16 +374,61 @@ class PluginTomlConfig:
     class_group_ids: List[int] = field(default_factory=list)
     admin_users: List[int] = field(default_factory=list)
     short_id_ttl_seconds: int = 300
+    ai_enabled: bool = True
     ai_api_key: str = ""
     ai_api_url: str = "https://api.deepseek.com/beta"
     ai_model: str = "deepseek-flash"
+    # --- provided by the unified config.toml -----------------------------
+    active_env: str = "dev"
+    debug_mode: bool = False
+
+
+def _plugin_config_from_unified(unified: Dict[str, Any]) -> PluginTomlConfig:
+    """Build :class:`PluginTomlConfig` from the flattened unified config.
+
+    ``class_group_ids`` / ``admin_users`` come from the currently active
+    environment, which is what makes the dev/prod switch work for the plugin.
+    """
+    defaults = PluginTomlConfig()
+    section = unified.get("plugin") if isinstance(unified.get("plugin"), dict) else {}
+    ai_section = unified.get("ai") if isinstance(unified.get("ai"), dict) else {}
+
+    return PluginTomlConfig(
+        internal_token=_opt_str(unified.get("internal_token"), defaults.internal_token),
+        server_ws_url=derive_plugin_ws_url(unified),
+        bot_name=_opt_str(section.get("bot_name"), defaults.bot_name),
+        class_group_ids=_int_list(unified.get("class_group_ids", [])),
+        admin_users=_int_list(unified.get("admin_users", [])),
+        short_id_ttl_seconds=int(unified.get("short_id_ttl_seconds") or defaults.short_id_ttl_seconds),
+        ai_enabled=bool(ai_section.get("enabled", defaults.ai_enabled)),
+        ai_api_key=_opt_str(ai_section.get("api_key"), defaults.ai_api_key),
+        ai_api_url=_opt_str(ai_section.get("api_url"), defaults.ai_api_url),
+        ai_model=_opt_str(ai_section.get("model"), defaults.ai_model),
+        active_env=_opt_str(unified.get("active_env"), defaults.active_env),
+        debug_mode=bool(unified.get("debug_mode", defaults.debug_mode)),
+    )
 
 
 def load_plugin_toml_config(config_path: Optional[Path] = None) -> PluginTomlConfig:
+    """Load the NoneBot plugin settings.
+
+    Reads the unified ``config.toml`` (active environment applied) when
+    available, otherwise falls back to a legacy ``plugin.toml``.
+    """
+    if config_path is None:
+        unified = load_unified_config()
+        if unified is not None:
+            return _plugin_config_from_unified(unified)
+
     path = _resolve_path(config_path, PLUGIN_CONFIG_ENV_VAR, PLUGIN_CONFIG_PATH)
     if not path.exists():
+        if config_path is None:
+            logger.warning(
+                "未找到 %s 且不存在旧版 plugin.toml，使用默认插件配置。", CONFIG_PATH
+            )
         return PluginTomlConfig()
 
+    logger.info("使用旧版配置文件 %s（建议迁移到统一的 config.toml）", path)
     raw = _load_toml(path)
     section = raw.get("plugin", {})
     ai_section = raw.get("ai", {})
@@ -303,6 +442,7 @@ def load_plugin_toml_config(config_path: Optional[Path] = None) -> PluginTomlCon
         short_id_ttl_seconds=int(_opt_str(
             section.get("short_id_ttl_seconds"), PluginTomlConfig().short_id_ttl_seconds,
         )),
+        ai_enabled=bool(ai_section.get("enabled", PluginTomlConfig().ai_enabled)),
         ai_api_key=_opt_str(ai_section.get("api_key"), PluginTomlConfig().ai_api_key),
         ai_api_url=_opt_str(ai_section.get("api_url"), PluginTomlConfig().ai_api_url),
         ai_model=_opt_str(ai_section.get("model"), PluginTomlConfig().ai_model),

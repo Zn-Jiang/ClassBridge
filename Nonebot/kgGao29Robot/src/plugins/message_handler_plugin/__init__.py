@@ -43,11 +43,69 @@ __plugin_meta__ = PluginMetadata(
 )
 
 config = merge_with_plugin_config(get_plugin_config(Config))
+#: mtime of config.toml at the last (re)load — drives the hot-reload check.
+_config_mtime: Optional[float] = None
 message_handler = on_message(priority=5, block=False)
 # AI classifier runs before the main handler so it can intercept natural-language
 # messages that aren't @-mentions.
 ai_handler = on_message(priority=4, block=False)
 receipt_task: Optional[asyncio.Task] = None
+
+# ---------------------------------------------------------------------------
+# 配置热重载：config.toml 被 admin 控制台修改后，插件无需重启即可生效。
+# 每个回执轮询周期（3 秒）检查一次文件 mtime。
+# ---------------------------------------------------------------------------
+
+
+def _refresh_config_if_changed() -> bool:
+    """Reload the plugin config when ``config.toml`` changed on disk.
+
+    Returns True when a reload actually happened.
+    """
+    global config, _config_mtime
+
+    try:
+        from shared.config_manager import get_config_manager
+
+        manager = get_config_manager()
+        mtime = manager.file_mtime()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("无法检查配置文件状态：{}", exc)
+        return False
+
+    if mtime is None:
+        return False
+    if _config_mtime is None:
+        # First check after start-up: remember the state, nothing to do.
+        _config_mtime = mtime
+        return False
+    if mtime == _config_mtime:
+        return False
+
+    _config_mtime = mtime
+    previous_env = getattr(config, "active_env", "?")
+    try:
+        reloaded = merge_with_plugin_config(get_plugin_config(Config))
+    except Exception as exc:
+        logger.warning("配置热重载失败，继续使用旧配置：{}", exc)
+        return False
+
+    config = reloaded
+    configure_ai_classifier(
+        api_key=config.ai_api_key,
+        base_url=config.ai_api_url,
+        model=config.ai_model,
+    )
+    logger.info(
+        "检测到 config.toml 变更，插件配置已热重载：active_env={}（原 {}）groups={} admins={} ai_enabled={}",
+        config.active_env,
+        previous_env,
+        config.class_group_ids,
+        config.admin_users,
+        config.ai_enabled,
+    )
+    return True
+
 
 # ---------------------------------------------------------------------------
 # 免@命令（free-form commands）：
@@ -89,14 +147,23 @@ async def _try_free_command(bot: Bot, event: GroupMessageEvent, content: str) ->
 
 @get_driver().on_startup
 async def _on_startup() -> None:
-    global receipt_task
+    global receipt_task, _config_mtime
     logger.info(
-        "message_handler_plugin loaded. groups={} admins={} server={} ai_model={}",
+        "message_handler_plugin loaded. active_env={} groups={} admins={} server={} ai={}",
+        config.active_env,
         config.class_group_ids,
         config.admin_users,
         config.server_ws_url,
-        config.ai_model or "(disabled)",
+        config.ai_model if config.ai_enabled else "(disabled)",
     )
+    # Remember the config file state so the hot-reload check only fires on real
+    # edits (rather than reloading once at start-up).
+    try:
+        from shared.config_manager import get_config_manager
+
+        _config_mtime = get_config_manager().file_mtime()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("无法读取 config.toml 状态：{}", exc)
     # Inject the AI configuration once, then warm the HTTP connection so the
     # first parent message doesn't pay for DNS/TLS.
     configure_ai_classifier(
@@ -135,6 +202,10 @@ async def handle_ai_classify(bot: Bot, event: MessageEvent) -> None:
     ran /查询 may issue free-form (no-@) commands such as "撤回 1" / "重发 2";
     anything that matches is handled locally and never reaches the AI.
     """
+    # AI classification can be turned off from the admin console ([ai].enabled).
+    if not config.ai_enabled:
+        return
+
     # Only applies to group messages (not private chat).
     if not isinstance(event, GroupMessageEvent):
         return
@@ -347,6 +418,11 @@ async def _handle_resend(bot: Bot, event: MessageEvent, short_id: str) -> None:
 
 async def _receipt_loop() -> None:
     while True:
+        try:
+            # Pick up config.toml edits made through the admin console.
+            _refresh_config_if_changed()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("配置热重载检查异常：{}", exc)
         try:
             payload = await send_request(config, MessageType.FETCH_RECEIPTS, data={})
             for item in payload.get("items", []):
