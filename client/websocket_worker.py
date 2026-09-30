@@ -41,13 +41,27 @@ class ClientWorker(QThread):
     def mark_read(self, db_id: int) -> None:
         self._commands.put({"type": "mark_read", "db_id": db_id})
 
+    def set_is_in_break(self, in_break: bool) -> None:
+        """Update the break state **and push it to the server immediately**.
+
+        Previously this only stored the flag in memory, so a client that stayed
+        connected never reported later transitions: the server kept the value
+        captured when the connection was established and the QQ bot kept telling
+        parents "当前正在上课" during breaks.  Queueing a status_update fixes it
+        (the queue also survives a reconnect, since the flag is re-sent on
+        connect as well).
+        """
+        state = bool(in_break)
+        if self._is_in_break == state:
+            return
+        self._is_in_break = state
+        self._commands.put(
+            {"type": "status_update", "is_online": True, "mode": self._current_mode().value}
+        )
+
     def set_exam_mode(self, enabled: bool) -> None:
         self._exam_mode = enabled
         self._commands.put({"type": "status_update", "is_online": True, "mode": self._current_mode().value})
-
-    def set_is_in_break(self, in_break: bool) -> None:
-        """Called from the main thread to update the break state sent to the server."""
-        self._is_in_break = in_break
 
     def request_snapshot(self) -> None:
         self._commands.put({"type": "snapshot"})

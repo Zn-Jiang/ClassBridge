@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import logging
 import sys
@@ -76,6 +77,9 @@ CLIENT_DIR = Path(__file__).resolve().parent
 ICON_ICO_PATH = CLIENT_DIR / "icon.ico"
 ICON_PNG_PATH = CLIENT_DIR / "icon.png"
 RETENTION_OPTIONS = {"1月": 30, "3月": 90, "1年": 365, "永久": 0}
+#: How long to wait for the break state / first snapshot before deciding the
+#: start-up visibility (the window stays hidden when the wait times out).
+_STARTUP_DECISION_TIMEOUT_MS = 12000
 logger = logging.getLogger("kg.client.main_window")
 
 
@@ -439,6 +443,9 @@ class BreakMonitorThread(QThread):
         self._last_break_key: Optional[str] = None
         self._last_popup_revision = -1
         self._last_in_break = False
+        #: Whether the current state has been reported at least once (the first
+        #: pass always reports, even when the state is "in class").
+        self._state_reported = False
 
     def stop(self) -> None:
         with self._lock:
@@ -497,7 +504,10 @@ class BreakMonitorThread(QThread):
                 if current_in_break != last_in_break:
                     self._last_in_break = current_in_break
 
-            if current_in_break != last_in_break:
+            if current_in_break != last_in_break or not self._state_reported:
+                # The first pass always reports, so the window knows the
+                # starting state instead of assuming "in class".
+                self._state_reported = True
                 self.break_state_changed.emit(current_in_break)
 
             if popup_break_key is not None:
@@ -677,6 +687,7 @@ class SettingsPage(QWidget):
         on_schedule_mode_changed: Callable[[str], None],
         on_break_delay_changed: Callable[[int], None],
         on_import_schedule: Callable[[], None],
+        on_use_cib_schedule_changed: Callable[[bool], None],
     ) -> None:
         super().__init__()
         self._config = config
@@ -689,6 +700,7 @@ class SettingsPage(QWidget):
         self._on_schedule_mode_changed = on_schedule_mode_changed
         self._on_break_delay_changed = on_break_delay_changed
         self._on_import_schedule = on_import_schedule
+        self._on_use_cib_schedule_changed = on_use_cib_schedule_changed
         self.setObjectName("settings_page")
         self._build_ui()
 
@@ -755,6 +767,18 @@ class SettingsPage(QWidget):
         import_row.addWidget(self.import_button)
         import_row.addWidget(self.local_schedule_label, 1)
         layout.addLayout(import_row)
+
+        # 2b) 是否允许用 CIB 时间表作为降级来源
+        self.use_cib_schedule_checkbox = QCheckBox(
+            "启用 CIB 时间表（ClassIsland 不可用时优先使用导入的课表）"
+        )
+        self.use_cib_schedule_checkbox.setChecked(bool(self._config.use_cib_schedule))
+        self.use_cib_schedule_checkbox.stateChanged.connect(self._change_use_cib_schedule)
+        layout.addWidget(self.use_cib_schedule_checkbox)
+        self.use_cib_schedule_hint = CaptionLabel("")
+        self.use_cib_schedule_hint.setWordWrap(True)
+        layout.addWidget(self.use_cib_schedule_hint)
+        self._refresh_use_cib_schedule_hint()
 
         # 3) 下课延时
         layout.addWidget(BodyLabel("下课弹窗延时"))
@@ -873,6 +897,28 @@ class SettingsPage(QWidget):
     def _change_break_delay(self, value: int) -> None:
         self._on_break_delay_changed(int(value))
 
+    def _change_use_cib_schedule(self, _state: int) -> None:
+        enabled = self.use_cib_schedule_checkbox.isChecked()
+        self._refresh_use_cib_schedule_hint()
+        self._on_use_cib_schedule_changed(enabled)
+
+    def _refresh_use_cib_schedule_hint(self) -> None:
+        if self.use_cib_schedule_checkbox.isChecked():
+            self.use_cib_schedule_hint.setText(
+                "ClassIsland/CIB 失效时：优先用导入的课表触发课间弹窗，其次才用下面的 JSON 文件。"
+            )
+        else:
+            self.use_cib_schedule_hint.setText(
+                "已关闭：降级时忽略导入的课表，直接使用下面的本地 JSON 时间表文件。"
+            )
+
+    def set_use_cib_schedule(self, enabled: bool) -> None:
+        """Reflect the persisted value without re-emitting signals."""
+        self.use_cib_schedule_checkbox.blockSignals(True)
+        self.use_cib_schedule_checkbox.setChecked(bool(enabled))
+        self.use_cib_schedule_checkbox.blockSignals(False)
+        self._refresh_use_cib_schedule_hint()
+
     def set_schedule_mode(self, mode: str) -> None:
         """Reflect the persisted schedule mode without re-emitting signals.
 
@@ -988,9 +1034,17 @@ class MainWindow(FluentWindow):
         self._config = config
         self._worker: Optional[ClientWorker] = None
         self._snapshot: Optional[ClientSnapshot] = None
+        # Signatures of the currently rendered message lists (see
+        # _messages_signature) — used to skip needless widget rebuilds.
+        self._unread_signature: Optional[Tuple] = None
+        self._history_signature: Optional[Tuple] = None
         self._last_time_sync: Optional[TimeSyncResult] = None
         self._last_time_sync_anchor: Optional[datetime] = None
         self._force_close = False
+        #: Set once ``exit_app()`` ran: background callbacks that complete
+        #: afterwards must not resurrect threads (a CIB probe finishing right
+        #: after shutdown used to start an orphaned monitor thread).
+        self._shutting_down = False
         self._last_connected_state: Optional[bool] = None
         self._notified_break_key: Optional[str] = None
         self._schedule_sources: List[ScheduleSource] = []
@@ -1026,16 +1080,33 @@ class MainWindow(FluentWindow):
         # ClassIsland process watchdog (started by _start_ci_watchdog)
         self._ci_watchdog: Optional[CiProcessWatcher] = None
         self._ci_alive: Optional[bool] = None
+        # Shown in the tray tooltip so the client's belief is inspectable.
+        self._connection_text = ""
+        self._schedule_source_label = ""
         # CIB (ClassIsland.WSBridge) supervision state.
         #   None = not checked yet, True = usable, False = known unavailable
         self._cib_ready: Optional[bool] = None
         self._cib_supervisor: Optional[CibSupervisor] = None
         self._cib_degrade_announced = False
+        # True while the bridge is reachable but cannot report class/break
+        # (no timetable loaded/enabled): breaks are then derived from a
+        # timetable so the reported state is not stuck on "in class".
+        self._ci_state_unusable = False
         # Deferred break popup (下课延时弹窗)
         self._break_popup_timer = QTimer(self)
         self._break_popup_timer.setSingleShot(True)
         self._break_popup_timer.timeout.connect(self._show_deferred_break_popup)
         self._deferred_break_popup: Optional[Tuple[str, int]] = None
+        #: Next subject of the break being announced (shown in the info bar).
+        self._pending_break_subject = ""
+        # Break state (None = not determined yet) and the start-up visibility
+        # decision: the window only appears on start-up when a break is running
+        # *and* there are unread messages.
+        self._break_state_known: Optional[bool] = None
+        self._startup_decision_pending = True
+        self._startup_timer = QTimer(self)
+        self._startup_timer.setSingleShot(True)
+        self._startup_timer.timeout.connect(lambda: self._decide_startup_visibility(timed_out=True))
 
         self.unread_page = MessageListPage("未读消息", show_read_button=True, on_mark_read=self._mark_read)
         self.history_page = MessageListPage("历史消息", show_read_button=False)
@@ -1050,6 +1121,7 @@ class MainWindow(FluentWindow):
             on_schedule_mode_changed=self._change_schedule_mode,
             on_break_delay_changed=self._change_break_delay,
             on_import_schedule=self._import_schedule_from_classisland,
+            on_use_cib_schedule_changed=self._change_use_cib_schedule,
         )
 
         self._init_window()
@@ -1130,6 +1202,9 @@ class MainWindow(FluentWindow):
 
     def _start_classisland_monitor(self) -> None:
         """Launch (or restart) the ClassIsland WebSocket monitor."""
+        if self._shutting_down:
+            logger.debug("Ignoring monitor start request: the window is shutting down")
+            return
         self._stop_classisland_monitor()
         self._classisland_monitor = ClassIslandMonitor(
             ws_url=self._config.classisland_ws_url,
@@ -1137,6 +1212,8 @@ class MainWindow(FluentWindow):
         )
         self._classisland_monitor.break_started.connect(self._on_classisland_break_started)
         self._classisland_monitor.class_started.connect(self._on_classisland_class_started)
+        self._classisland_monitor.state_synced.connect(self._on_ci_state_synced)
+        self._classisland_monitor.state_unavailable.connect(self._on_ci_state_unavailable)
         self._classisland_monitor.connection_changed.connect(self._on_classisland_connection_changed)
         self._classisland_monitor.error_occurred.connect(self._show_warning)
         self._classisland_monitor.fallback_needed.connect(self._on_classisland_fallback_needed)
@@ -1161,25 +1238,19 @@ class MainWindow(FluentWindow):
     # ------------------------------------------------------------------
 
     def _start_ci_watchdog(self) -> None:
-        """Start the background ClassIsland process watchdog."""
+        """Start the background ClassIsland process watchdog.
+
+        Detection is deliberately left to the worker thread: enumerating every
+        process with psutil can take 1-2 seconds, and doing it here used to
+        freeze the UI during start-up.
+        """
         if self._ci_watchdog is not None:
             return
         watchdog = CiProcessWatcher(parent=self)
         watchdog.alive_changed.connect(self._on_ci_alive_changed)
-        # Prime the state synchronously so we don't have to wait for the first
-        # poll to know whether ClassIsland is around.
-        try:
-            self._ci_alive = watchdog.check_alive()
-        except Exception:
-            logger.exception("ClassIsland watchdog priming failed")
-            self._ci_alive = None
         self._ci_watchdog = watchdog
         watchdog.start()
-        logger.info("ClassIsland watchdog started (alive=%s)", self._ci_alive)
-        # Apply right away: the first watchdog emit would be swallowed by the
-        # "state unchanged" guard, so a missing ClassIsland must degrade here.
-        if self._ci_alive is not None:
-            self._apply_schedule_mode()
+        logger.info("ClassIsland watchdog started (first check runs in the background)")
 
     def _stop_ci_watchdog(self) -> None:
         if self._ci_watchdog is None:
@@ -1215,6 +1286,8 @@ class MainWindow(FluentWindow):
         # now be launchable again.
         self._cib_ready = None
         self._cib_degrade_announced = False
+        # A (re)started ClassIsland gets a fresh chance to report its state.
+        self._ci_state_unusable = False
         reason = (
             "ClassIsland 已启动，恢复实时联动"
             if alive
@@ -1248,10 +1321,20 @@ class MainWindow(FluentWindow):
             reason = reason or "ClassIsland 未运行，已自动降级为本地课表"
         else:
             use_ci = True
-            ranges = []
-            detail = "ClassIsland 实时联动"
+            if self._ci_state_unusable:
+                # The bridge is reachable but cannot report a class/break state
+                # (no timetable loaded/enabled, or an unusable CurrentState).
+                # Keep it connected for events, but drive the state from a
+                # timetable so breaks are still detected and reported.
+                ranges, detail = self._local_fallback_ranges()
+                reason = reason or "ClassIsland 未加载课表，已按课表推算课间状态"
+            else:
+                ranges = []
+                detail = "ClassIsland 实时联动"
 
         self._schedule_ranges = list(ranges)
+        self._schedule_source_label = detail
+        self._refresh_tray_tooltip()
         self._break_monitor.update_schedule_ranges(self._schedule_ranges)
 
         if use_ci:
@@ -1279,6 +1362,8 @@ class MainWindow(FluentWindow):
 
     def _start_cib_then_monitor(self) -> None:
         """Enable live ClassIsland events once CIB is verified/launched."""
+        if self._shutting_down:
+            return
         if self._cib_ready is False:
             # Already known to be unavailable — stay degraded.
             self._degrade_to_local_schedule()
@@ -1325,9 +1410,25 @@ class MainWindow(FluentWindow):
         """Handle the CIB check result: enable live events or degrade."""
         self._cib_supervisor = None
 
+        if self._shutting_down:
+            logger.debug("CIB check finished after shutdown — nothing to apply")
+            return
+
         if result is not None and result.ok:
             self._cib_ready = True
             logger.info("CIB ready: %s", result.message)
+            # The probe runs in the background, so the situation may have
+            # changed while it was in flight: the watchdog (or the user) can
+            # have decided to degrade in the meantime.  Starting live events
+            # then would resurrect a monitor whose ClassIsland is gone — the
+            # exact source of "bot says class while it is a break".
+            if self._ci_alive is False or str(self._config.schedule_mode).lower() == "local":
+                logger.info(
+                    "CIB is ready but ClassIsland is unavailable (alive=%s) — staying degraded",
+                    self._ci_alive,
+                )
+                self._degrade_to_local_schedule()
+                return
             self._start_classisland_monitor()
             return
 
@@ -1349,26 +1450,35 @@ class MainWindow(FluentWindow):
         self._stop_classisland_monitor()
         ranges, detail = self._local_fallback_ranges()
         self._schedule_ranges = list(ranges)
+        self._schedule_source_label = detail
+        self._refresh_tray_tooltip()
         self._break_monitor.update_schedule_ranges(self._schedule_ranges)
         logger.info("Degraded to local timetable: %s (%s breaks)", detail, len(self._schedule_ranges))
 
     def _local_fallback_ranges(self) -> Tuple[List[Tuple], str]:
         """Break ranges for local operation.
 
-        Prefers the timetable imported from ClassIsland and falls back to an
-        explicitly selected JSON schedule file.
+        When ``use_cib_schedule`` is enabled the timetable imported from
+        ClassIsland ("CIB 时间表") is preferred; disabling it skips straight to
+        the explicitly selected JSON schedule file.
         """
-        if self._schedule_store.has_schedule:
+        if self._config.use_cib_schedule and self._schedule_store.has_schedule:
             schedule = self._schedule_store.current()
             return (
                 self._schedule_store.break_ranges(),
-                schedule.describe() if schedule is not None else "本地课表",
+                schedule.describe() if schedule is not None else "CIB 时间表",
             )
+
         source = self._schedule_source
         if source is not None and not source.is_classisland:
             ranges, _ = validate_schedule_file(source.path)
             if ranges:
                 return ranges, source.label
+
+        # Nothing usable: if the CIB timetable exists but was disabled, say so
+        # instead of leaving the user wondering why it is empty.
+        if not self._config.use_cib_schedule and self._schedule_store.has_schedule:
+            logger.info("CIB timetable disabled by configuration; no local source available")
         return [], "无可用课表"
 
     def _announce_schedule_source(
@@ -1426,6 +1536,18 @@ class MainWindow(FluentWindow):
             else:
                 self._break_popup_timer.start(seconds * 1000)
 
+    def _change_use_cib_schedule(self, enabled: bool) -> None:
+        """Toggle whether the imported (CIB) timetable may back a degradation."""
+        enabled = bool(enabled)
+        if self._config.use_cib_schedule == enabled:
+            return
+        self._config.use_cib_schedule = enabled
+        save_client_config(self._config)
+        logger.info("use_cib_schedule set to %s", enabled)
+        # Re-evaluate the active source: this setting changes which timetable
+        # backs a degradation.
+        self._apply_schedule_mode()
+
     def _import_schedule_from_classisland(self) -> None:
         """Open the 3-step import wizard and persist the chosen timetable."""
         wizard = ScheduleImportWizard(parent=self)
@@ -1447,27 +1569,82 @@ class MainWindow(FluentWindow):
             self._show_info(f"课表已导入：{schedule.describe()}")
 
     def _on_classisland_break_started(self, next_subject: str) -> None:
-        """Called when ClassIsland signals the start of a break."""
+        """Called when ClassIsland signals the start of a break.
+
+        The popup goes through the *same* path as the local timetable monitor,
+        so the "延时弹窗" setting now applies to ClassIsland events too (this
+        handler used to call ``show_normal()`` immediately, which is why a 5 s
+        delay appeared to do nothing in the classroom) and the window is no
+        longer raised when there is nothing to read.
+        """
         logger.info(
             "ClassIsland break started: next=%s active_window=%s visible=%s",
             next_subject,
             self.isActiveWindow(),
             self.isVisible(),
         )
-        self._push_break_state_to_worker(True)
-        self.show_normal(force_topmost=True, switch_to_unread=True)
+        self._set_break_state(True)
+        self._pending_break_subject = next_subject
+
         unread_count = self._current_unread_count()
-        if unread_count > 0:
-            self._show_info(
-                f"课间休息（下节：{next_subject}），有 {unread_count} 条未读消息"
-            )
-        else:
-            self._show_info(f"课间休息（下节：{next_subject}）")
+        if unread_count <= 0:
+            logger.info("Break started (%s) with no unread messages — staying in the tray", next_subject)
+            with contextlib.suppress(Exception):
+                self.tray.showMessage("课间休息", f"下节课：{next_subject}")
+            return
+
+        self._on_break_popup_requested(self._ci_break_key(), unread_count)
+
+    def _ci_break_key(self) -> str:
+        """Dedup key for a break announced by a ClassIsland event.
+
+        Mirrors the local monitor's ``start-end`` key whenever the timetable
+        also covers this break, so a break announced by *both* sources (which
+        happens while a degraded timetable is active) is announced only once.
+        """
+        now = datetime.now()
+        current = now.time()
+        for start, end in self._schedule_ranges:
+            if start <= current <= end:
+                return f"{start.isoformat()}-{end.isoformat()}"
+        return f"ci-{now.strftime('%Y-%m-%d %H:%M')}"
 
     def _on_classisland_class_started(self) -> None:
         """Called when ClassIsland signals the start of a class period."""
         logger.info("ClassIsland: class started")
-        self._push_break_state_to_worker(False)
+        self._set_break_state(False)
+
+    def _on_ci_state_synced(self, in_break: bool) -> None:
+        """Authoritative state read from the bridge (``CurrentState``).
+
+        Emitted on every calibration poll, so it also covers the case where the
+        client starts *during* a break (no transition event ever arrives).
+        """
+        if self._ci_state_unusable:
+            # The bridge answers again — hand class/break detection back to it.
+            self._ci_state_unusable = False
+            logger.info("ClassIsland bridge reports a usable state again; live events restored")
+            self._apply_schedule_mode(announce=False)
+        self._set_break_state(in_break)
+
+    def _on_ci_state_unavailable(self) -> None:
+        """The bridge is up but cannot tell class from break.
+
+        ClassIsland reports ``CurrentState=None`` whenever no timetable is
+        loaded/enabled, which is *not* "in class".  Without this the client
+        would silently keep its initial value forever, so the QQ bot would keep
+        answering "当前正在上课" during breaks.  Degrade to a timetable instead.
+        """
+        if self._ci_state_unusable:
+            return
+        self._ci_state_unusable = True
+        logger.warning(
+            "ClassIsland bridge gave no usable class/break state; "
+            "deriving break/class from the timetable instead"
+        )
+        self._apply_schedule_mode(
+            announce=True, reason="ClassIsland 未加载课表，已按课表推算课间状态"
+        )
 
     def _on_classisland_connection_changed(self, connected: bool, text: str) -> None:
         """Update the window title with ClassIsland connection status."""
@@ -1739,7 +1916,8 @@ class MainWindow(FluentWindow):
         self._last_connected_state = connected
         mode = self._snapshot.mode if self._snapshot else ClientMode.NORMAL
         self._update_window_title(connected, mode)
-        self.tray.setToolTip(f"家校沟通客户端 - {text}")
+        self._connection_text = text
+        self._refresh_tray_tooltip()
         if connected:
             # Reconnect succeeded — replay any read receipts persisted while
             # the link was down.
@@ -1751,9 +1929,21 @@ class MainWindow(FluentWindow):
         snapshot = self._apply_settling_reads(snapshot)
         snapshot.history_items = self._retained_history_items(snapshot.history_items)
         self._snapshot = snapshot
-        self.unread_page.set_messages(snapshot.unread_items)
-        self.unread_page.set_pending_read_ids(self._pending_read_ids)
-        self.history_page.set_messages(snapshot.history_items)
+        # Rebuilding the message lists costs hundreds of milliseconds for a
+        # full history (200 rows), and a snapshot arrives every ~2 seconds.
+        # Compare a cheap signature first so unchanged lists are skipped — this
+        # is what removes the periodic UI stutter.
+        unread_signature = self._messages_signature(snapshot.unread_items)
+        history_signature = self._messages_signature(snapshot.history_items)
+
+        if unread_signature != self._unread_signature:
+            self._unread_signature = unread_signature
+            self.unread_page.set_messages(snapshot.unread_items)
+            self.unread_page.set_pending_read_ids(self._pending_read_ids)
+        if history_signature != self._history_signature:
+            self._history_signature = history_signature
+            self.history_page.set_messages(snapshot.history_items)
+
         self.settings_page.set_exam_mode(snapshot.mode == ClientMode.EXAM)
         # Title reflects the *local* WebSocket state, not the server-side
         # is_online flag: the latter can be stale (e.g. a previous connection's
@@ -1775,6 +1965,27 @@ class MainWindow(FluentWindow):
 
         self._show_next_urgent_popup()
         self._update_break_monitor_state(changed_unread_ids)
+        # The start-up decision needs both the break state and the first
+        # snapshot (to know whether anything is unread).
+        self._decide_startup_visibility()
+
+    @staticmethod
+    def _messages_signature(items: List[ClientMessage]) -> Tuple:
+        """Cheap identity of a message list.
+
+        Used to skip rebuilding the list widgets when a snapshot carries exactly
+        the same messages (which is the common case: a snapshot is fetched every
+        ~2 seconds but only changes when something actually happens).
+        """
+        return tuple(
+            (
+                message.db_id,
+                message.status.value if hasattr(message.status, "value") else message.status,
+                message.resend_count,
+                message.resend_time,
+            )
+            for message in items
+        )
 
     def _changed_unread_ids(
         self,
@@ -1832,22 +2043,118 @@ class MainWindow(FluentWindow):
         self.show_normal(force_topmost=True, switch_to_unread=True)
         if self._notified_break_key != break_key:
             self._notified_break_key = break_key
-            self._show_info(f"课间休息，有 {unread_count} 条未读消息")
+            subject = self._pending_break_subject
+            if subject:
+                self._show_info(f"课间休息（下节：{subject}），有 {unread_count} 条未读消息")
+            else:
+                self._show_info(f"课间休息，有 {unread_count} 条未读消息")
 
     def _on_break_state_changed(self, in_break: bool) -> None:
-        """Push the latest break state to the WebSocket worker so the server
-        knows whether the client is currently in class or on break."""
-        self._push_break_state_to_worker(in_break)
-        if not in_break and self._break_popup_timer.isActive():
+        """Break state from the local timetable monitor."""
+        self._set_break_state(in_break)
+
+    def _set_break_state(self, in_break: bool) -> None:
+        """Single entry point for every break-state source.
+
+        Records the state, reports it to the server, cancels a pending deferred
+        popup when the break ended, and lets the start-up decision proceed.
+        All steps are idempotent, so polling-based refreshes are harmless.
+        """
+        state = bool(in_break)
+        changed = self._break_state_known != state
+        self._break_state_known = state
+        if changed:
+            # One line the user (or the next developer) can grep to see what the
+            # client currently believes and which source told it so.
+            logger.info(
+                "Break state: %s (source=%s)",
+                "课间" if state else "上课",
+                self._schedule_source_label or "未知",
+            )
+        self._refresh_tray_tooltip()
+        self._push_break_state_to_worker(state)
+
+        if not state and self._break_popup_timer.isActive():
             # The break ended before the deferred popup fired — drop it.
             self._break_popup_timer.stop()
             self._deferred_break_popup = None
             logger.info("Deferred break popup cancelled: break already ended")
+        if not state:
+            self._pending_break_subject = ""
+
+        self._decide_startup_visibility()
 
     def _push_break_state_to_worker(self, in_break: bool) -> None:
         """Notify the server of the current class/break status."""
         if self._worker is not None:
             self._worker.set_is_in_break(in_break)
+
+    def _refresh_tray_tooltip(self, extra: str = "") -> None:
+        """Make the client's belief visible: connection + state + source.
+
+        Hovering the tray icon is the fastest way for a user to answer "what
+        does the client think it is right now, and who told it that?".
+        """
+        parts = ["家校沟通客户端"]
+        if self._connection_text:
+            parts.append(self._connection_text)
+        if extra:
+            parts.append(extra)
+        if self._break_state_known is not None:
+            parts.append("课间" if self._break_state_known else "上课")
+        if self._schedule_source_label:
+            parts.append(self._schedule_source_label)
+        self.tray.setToolTip(" - ".join(parts))
+
+    # ------------------------------------------------------------------
+    # start-up visibility（启动时是否弹出主窗口）
+    # ------------------------------------------------------------------
+
+    def begin_startup(self) -> None:
+        """Start the start-up visibility decision.
+
+        Called by ``client/app.py`` instead of an unconditional ``show()``:
+        the window only appears when the client is *in a break* and there are
+        unread messages; otherwise it stays in the tray.  A timeout guarantees
+        a decision even if the state never becomes available.
+        """
+        logger.info("Start-up visibility decision started (timeout=%sms)", _STARTUP_DECISION_TIMEOUT_MS)
+        self._startup_timer.start(_STARTUP_DECISION_TIMEOUT_MS)
+        self._decide_startup_visibility()
+
+    def _decide_startup_visibility(self, *, timed_out: bool = False) -> None:
+        if not self._startup_decision_pending:
+            return
+
+        state_known = self._break_state_known is not None
+        snapshot_ready = self._snapshot is not None
+        if not timed_out and (not state_known or not snapshot_ready):
+            return
+
+        self._startup_decision_pending = False
+        self._startup_timer.stop()
+
+        in_break = bool(self._break_state_known) if state_known else False
+        unread = self._current_unread_count()
+
+        if in_break and unread > 0:
+            logger.info("Start-up: break with %s unread message(s) -> showing window", unread)
+            self.show_normal(force_topmost=True, switch_to_unread=True)
+            return
+
+        if not state_known:
+            reason = "未获取到课间状态（按上课处理）"
+        elif in_break:
+            reason = "课间暂无未读消息"
+        else:
+            reason = "当前为上课时间"
+        if timed_out and not snapshot_ready:
+            reason += "（等待超时）"
+
+        logger.info("Start-up: staying in the tray (%s)", reason)
+        self._refresh_tray_tooltip(reason)
+        with contextlib.suppress(Exception):
+            self.tray.showMessage("家校沟通客户端", f"已在后台运行：{reason}")
 
     def _apply_settling_reads(self, snapshot: ClientSnapshot) -> ClientSnapshot:
         if not self._settling_read_ids:
@@ -2126,6 +2433,9 @@ class MainWindow(FluentWindow):
         event.accept()
 
     def exit_app(self) -> None:
+        # Flip this *first*: a CIB check or watchdog callback that completes
+        # after this point must not start any new thread.
+        self._shutting_down = True
         if self._active_urgent_dialog is not None:
             self._active_urgent_dialog.close()
             self._active_urgent_dialog = None

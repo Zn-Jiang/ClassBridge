@@ -106,7 +106,9 @@ class ServerConfig:
     # --- provided by the unified config.toml -----------------------------
     active_env: str = "dev"
     debug_mode: bool = False
-    admin_host: str = "127.0.0.1"
+    # Admin API listens on all interfaces by default so the console works from
+    # another machine; protect it with admin_secret_token (and firewall rules).
+    admin_host: str = "0.0.0.0"
     admin_port: int = 8766
     admin_secret_token: str = ""
 
@@ -217,6 +219,10 @@ class ClientConfig:
     schedule_mode: str = "auto"
     # Seconds to wait after a break starts before showing the popup.
     break_popup_delay_seconds: int = 0
+    # When ClassIsland/CIB is unavailable, may the timetable imported from
+    # ClassIsland ("CIB 时间表") be used as the fallback?  When disabled the
+    # client degrades straight to the local JSON schedule.
+    use_cib_schedule: bool = True
     # Optional explicit path to ClassIsland.WSBridge.exe (empty = auto-detect).
     cib_exe_path: str = ""
     classisland_ws_url: str = "ws://localhost:6614/"
@@ -278,6 +284,7 @@ def load_client_config(config_path: Optional[Path] = None) -> ClientConfig:
             section.get("break_popup_delay_seconds"), ClientConfig().break_popup_delay_seconds,
         )),
         cib_exe_path=_opt_str(section.get("cib_exe_path"), ClientConfig().cib_exe_path),
+        use_cib_schedule=bool(section.get("use_cib_schedule", ClientConfig().use_cib_schedule)),
         classisland_ws_url=_opt_str(section.get("classisland_ws_url"), ClientConfig().classisland_ws_url),
         ntp_server=_opt_str(section.get("ntp_server"), ClientConfig().ntp_server),
         auto_popup_on_break=bool(section.get("auto_popup_on_break", ClientConfig().auto_popup_on_break)),
@@ -326,6 +333,7 @@ def _dump_client_toml(config: ClientConfig) -> str:
         f'schedule_mode = "{_esc(config.schedule_mode)}"',
         f"break_popup_delay_seconds = {config.break_popup_delay_seconds}",
         f'cib_exe_path = "{_esc(config.cib_exe_path)}"',
+        f"use_cib_schedule = {_bool_str(config.use_cib_schedule)}",
         f'classisland_ws_url = "{_esc(config.classisland_ws_url)}"',
         f'ntp_server = "{_esc(config.ntp_server)}"',
         f"auto_popup_on_break = {_bool_str(config.auto_popup_on_break)}",

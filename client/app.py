@@ -38,5 +38,8 @@ def main() -> int:
     setThemeColor("#0f766e")
 
     window = MainWindow(config)
-    window.show()
+    # The window decides on its own whether to appear: it only shows up when the
+    # client is in a break *and* there are unread messages, otherwise it stays
+    # in the tray (see MainWindow.begin_startup).
+    window.begin_startup()
     return app.exec()

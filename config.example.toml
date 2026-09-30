@@ -48,7 +48,9 @@ client_ws_path = "/ws/client"
 plugin_ws_path = "/ws/plugin"
 client_name = "classroom-desktop"
 # 管理后台 HTTP API 监听地址与端口（与 WebSocket 端口分开，避免冲突）
-admin_host = "127.0.0.1"
+# 0.0.0.0 = 允许外网/其他机器访问控制台（务必依赖 admin_secret_token 保护，
+# 并建议在防火墙中限制来源 IP）；仅本机使用可改为 127.0.0.1
+admin_host = "0.0.0.0"
 admin_port = 8766
 
 [plugin]

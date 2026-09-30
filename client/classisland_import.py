@@ -34,6 +34,9 @@ CLASSISLAND_PROCESS_NAME = "ClassIsland.Desktop.exe"
 #: ClassIsland ``TimeType`` values.
 TIME_TYPE_CLASS = 0
 TIME_TYPE_BREAK = 1
+#: Separator / divider rows — they carry no schedule information and must be
+#: skipped when importing a timetable.
+TIME_TYPE_SEPARATOR = 2
 
 _SETTINGS_FILENAME = "Settings.json"
 _PROFILES_DIRNAME = "Profiles"
@@ -521,6 +524,15 @@ class ClassIslandConfigParser:
         time_type = parse_time_type(_find_key(node, "TimeType", "time_type"))
         if time_type is None:
             time_type = TIME_TYPE_CLASS
+
+        # Only lessons (0) and breaks (1) matter; separator rows (2) and any
+        # unknown type are dropped so they never reach the client timetable.
+        if time_type == TIME_TYPE_SEPARATOR:
+            logger.debug("Skipping separator node %s (%s-%s)", index, start, end)
+            return None
+        if time_type not in (TIME_TYPE_CLASS, TIME_TYPE_BREAK):
+            logger.debug("Skipping node %s with unsupported TimeType=%s", index, time_type)
+            return None
 
         return TimeLayoutEntry(index=index, time_type=time_type, start=start, end=end)
 

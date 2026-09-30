@@ -204,26 +204,37 @@ async def handle_ai_classify(bot: Bot, event: MessageEvent) -> None:
     """
     # AI classification can be turned off from the admin console ([ai].enabled).
     if not config.ai_enabled:
+        logger.debug("AI classify: skipped (AI disabled in config)")
         return
 
     # Only applies to group messages (not private chat).
     if not isinstance(event, GroupMessageEvent):
+        logger.debug("AI classify: skipped (not a group message)")
         return
 
     # Only for configured class groups.
     if event.group_id not in set(config.class_group_ids):
+        logger.debug("AI classify: skipped (group %s is not monitored)", event.group_id)
         return
 
     # Skip messages from admins — they use explicit @bot commands, never AI.
+    # Logged at INFO because a silent skip here looks exactly like "the AI is
+    # broken" (it is the most common reason a message never reaches the model).
     if event.user_id in set(config.admin_users):
+        logger.info(
+            "AI classify: skipped (user %s is an admin — admins use explicit @bot commands)",
+            event.user_id,
+        )
         return
 
     # Skip @bot messages — the main handler already processes them.
     if event.is_tome():
+        logger.debug("AI classify: skipped (mentions the bot — handled by the main handler)")
         return
 
     content = event.get_plaintext().strip()
     if not content:
+        logger.debug("AI classify: skipped (empty text)")
         return
 
     # 1) Rule matching first (no token cost): free-form commands for users
@@ -234,6 +245,7 @@ async def handle_ai_classify(bot: Bot, event: MessageEvent) -> None:
 
     # Skip explicit slash commands (no point sending them to AI).
     if content.startswith("/"):
+        logger.info("AI classify: skipped (explicit command %r)", content[:24])
         return
 
     logger.info(
