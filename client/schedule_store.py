@@ -105,6 +105,10 @@ class StoredSchedule:
     imported_at: str = ""
     profile_file: str = ""
     layout_name: str = ""
+    #: ClassIsland timetable id (``ClassPlans[..].TimeLayoutId``, which keys into
+    #: the profile's ``TimeLayouts``) that was active when this copy was taken.
+    #: Used to notice that the teacher switched to a different timetable.
+    layout_id: str = ""
     version: int = SCHEDULE_STORE_VERSION
 
     # ------------------------------------------------------------------
@@ -131,6 +135,45 @@ class StoredSchedule:
             ranges.append((start, end))
         return ranges
 
+    def non_class_ranges(self) -> List[Tuple[time, time]]:
+        """可弹窗时段：**非上课**时间（含早于第一节、晚于最后一节）。
+
+        课表里的 ``break`` 节点并不覆盖首尾两端——第一节课之前与最后一节课之后
+        同样不在上课，按需求也应视为课间、可以弹窗。因此这里以「上课」节点为基准
+        取补集，得到 ``00:00`` 起、``23:59:59`` 止的连续非上课区间。
+
+        课表里没有任何上课节点时，退化为 :meth:`break_ranges`（保持旧行为）。
+        """
+        class_windows: List[Tuple[time, time]] = []
+        for entry in self.entries:
+            if entry.type == TYPE_BREAK:
+                continue
+            start = entry.start_time
+            end = entry.end_time
+            if start is None or end is None:
+                continue
+            class_windows.append((start, end))
+
+        if not class_windows:
+            return self.break_ranges()
+
+        class_windows.sort(key=lambda item: item[0])
+        day_start = time(0, 0)
+        day_end = time(23, 59, 59)
+
+        ranges: List[Tuple[time, time]] = []
+        cursor = day_start
+        for start, end in class_windows:
+            if start > cursor:
+                ranges.append((cursor, start))
+            if end > cursor:
+                cursor = end
+        if cursor < day_end:
+            ranges.append((cursor, day_end))
+
+        # 去掉零长度区间（相邻节点首尾相接时会出现）
+        return [(start, end) for start, end in ranges if start < end]
+
     @property
     def is_empty(self) -> bool:
         return not self.entries
@@ -152,6 +195,7 @@ class StoredSchedule:
             "imported_at": self.imported_at,
             "profile_file": self.profile_file,
             "layout_name": self.layout_name,
+            "layout_id": self.layout_id,
             "entries": [entry.to_dict() for entry in self.entries],
             # Compatibility mirror for schedule_loader's "breaks" format.
             "breaks": [
@@ -191,6 +235,7 @@ class StoredSchedule:
             imported_at=str(data.get("imported_at", "")),
             profile_file=str(data.get("profile_file", "")),
             layout_name=str(data.get("layout_name", "")),
+            layout_id=str(data.get("layout_id", "")),
             version=int(data.get("version", SCHEDULE_STORE_VERSION) or SCHEDULE_STORE_VERSION),
         )
 
@@ -212,6 +257,7 @@ class StoredSchedule:
             imported_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             profile_file=option.profile_file,
             layout_name=option.name,
+            layout_id=option.layout_id,
         )
 
     @classmethod
@@ -221,6 +267,7 @@ class StoredSchedule:
         *,
         profile_file: str = "",
         layout_name: str = "",
+        layout_id: str = "",
         source: str = "classisland",
     ) -> "StoredSchedule":
         return cls(
@@ -229,6 +276,7 @@ class StoredSchedule:
             imported_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             profile_file=profile_file,
             layout_name=layout_name,
+            layout_id=layout_id,
         )
 
 
@@ -281,6 +329,13 @@ class ScheduleStore:
         if schedule is None:
             return []
         return schedule.break_ranges()
+
+    def non_class_ranges(self) -> List[Tuple[time, time]]:
+        """当前课表的「非上课时段」（含第一节课前与最后一节课后）。"""
+        schedule = self.load()
+        if schedule is None or schedule.is_empty:
+            return []
+        return schedule.non_class_ranges()
 
     @property
     def has_schedule(self) -> bool:

@@ -23,6 +23,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -118,6 +119,40 @@ class CiPaths:
     @property
     def is_complete(self) -> bool:
         return bool(self.data_dir and self.settings_path and self.profiles_dir)
+
+
+@dataclass
+class ActiveClassPlan:
+    """One ``ClassPlans`` entry of a profile.
+
+    ClassIsland keeps several class plans per profile (one per weekday, plus
+    single/double-week variants).  Each plan points at a timetable through
+    ``TimeLayoutId``, which is a key of the profile's ``TimeLayouts`` map.
+    Knowing *which* plan is active for today lets the client notice that the
+    teacher switched timetables after the local copy was taken.
+    """
+
+    plan_id: str
+    name: str
+    layout_id: str
+    #: ``TimeRule.WeekDay`` — 0 = 周日, 1 = 周一 … 6 = 周六 (ClassIsland's own convention).
+    weekday: Optional[int] = None
+    is_enabled: bool = True
+    #: True when ``WeekDay`` matches the requested day.
+    matches_day: bool = False
+
+    @property
+    def label(self) -> str:
+        day = "周日周一二三四五六"[self.weekday] if self.weekday is not None else "?"
+        return f"{self.name}（{day}）" if self.weekday is not None else self.name
+
+
+#: ClassIsland weekday numbering: 0 = Sunday … 6 = Saturday.
+def classisland_weekday(day: Optional[date] = None) -> int:
+    """Convert a date into ClassIsland's weekday index (0 = 周日, 6 = 周六)."""
+    reference = day or date.today()
+    # Python: Monday = 0 … Sunday = 6  →  ClassIsland: Sunday = 0 … Saturday = 6
+    return (reference.weekday() + 1) % 7
 
 
 @dataclass
@@ -272,30 +307,78 @@ class ClassIslandConfigParser:
             logger.warning("psutil is not installed; cannot auto-detect ClassIsland.")
             return None
 
+        pid = ClassIslandConfigParser.find_process_pid()
+        if pid is None:
+            return None
         try:
-            for process in psutil.process_iter(["name", "exe"]):
+            exe = psutil.Process(pid).exe()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as exc:
+            logger.debug("Cannot read the ClassIsland executable path: %s", exc)
+            return None
+        if exe:
+            logger.info("Detected ClassIsland process: %s", exe)
+            return Path(exe)
+        return None
+
+    @staticmethod
+    def find_process_pid() -> Optional[int]:
+        """PID of a running ClassIsland process, or ``None``.
+
+        Uses the Win32 tool-help snapshot when available (~10 ms for a few
+        hundred processes).  ``psutil.process_iter(["name"])`` costs ~1.2 s
+        because it opens every process, and polling that every five seconds kept
+        the interpreter busy in bursts — the reported "UI stutters every 6
+        seconds while dragging the window".  psutil remains the fallback.
+        """
+        from . import win_process
+
+        if win_process.available():
+            pid = win_process.find_pid_by_name(CLASSISLAND_PROCESS_NAME)
+            if pid is not None:
+                return pid
+            # Fall through to psutil only when the fast path found nothing and
+            # psutil might know better (e.g. a process the snapshot cannot see).
+            fast_absent = True
+        else:
+            fast_absent = False
+
+        try:
+            import psutil  # imported lazily: optional at import time
+        except ImportError:
+            logger.warning("psutil is not installed; cannot detect ClassIsland.")
+            return None
+
+        if fast_absent:
+            logger.debug("ClassIsland not present in the Win32 process snapshot")
+            return None
+
+        try:
+            for process in psutil.process_iter(["name", "pid"]):
                 try:
-                    info = process.info
-                    name = str(info.get("name") or "")
-                    if name.lower() != CLASSISLAND_PROCESS_NAME.lower():
-                        continue
-                    exe = info.get("exe")
-                    if exe:
-                        logger.info("Detected ClassIsland process: %s", exe)
-                        return Path(exe)
+                    name = str(process.info.get("name") or "")
+                    if name.lower() == CLASSISLAND_PROCESS_NAME.lower():
+                        return int(process.info["pid"])
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Failed to enumerate processes: %s", exc)
+            return None
         return None
 
-    @staticmethod
-    def is_process_running() -> Optional[bool]:
+    #: PID of the ClassIsland process found by the last full scan.  Used to skip
+    #: the (expensive) table enumeration while the process keeps running.
+    _known_pid: Optional[int] = None
+
+    @classmethod
+    def is_process_running(cls) -> Optional[bool]:
         """Return whether ClassIsland is running.
 
         ``None`` means "could not be determined" (psutil unavailable or the
         process table could not be read) — callers should then keep their
         current behaviour instead of assuming ClassIsland is gone.
+
+        Steady-state cost is a single ``pid_exists`` + name lookup: the full
+        table scan only runs when the remembered PID is gone or never found.
         """
         try:
             import psutil  # imported lazily: optional at import time
@@ -303,18 +386,27 @@ class ClassIslandConfigParser:
             logger.warning("psutil is not installed; cannot detect ClassIsland.")
             return None
 
-        try:
-            for process in psutil.process_iter(["name"]):
-                try:
-                    name = str(process.info.get("name") or "")
+        known = cls._known_pid
+        if known is not None:
+            try:
+                if psutil.pid_exists(known):
+                    name = str(psutil.Process(known).name() or "")
                     if name.lower() == CLASSISLAND_PROCESS_NAME.lower():
                         return True
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    continue
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("Failed to enumerate processes: %s", exc)
-            return None
-        return False
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+            except Exception:  # pragma: no cover - defensive
+                pass
+            cls._known_pid = None
+
+        pid = cls.find_process_pid()
+        cls._known_pid = pid
+        return pid is not None
+
+    @classmethod
+    def forget_process(cls) -> None:
+        """Drop the cached PID (used by tests and after a restart)."""
+        cls._known_pid = None
 
     @staticmethod
     def data_dir_from_exe(exe_path: Path) -> Optional[Path]:
@@ -567,6 +659,103 @@ class ClassIslandConfigParser:
         if not result.layouts:
             result.error = f"{result.profile_file} 中没有找到可用的时间表。"
         return result
+
+    # ------------------------------------------------------------------
+    # which class plan is active today?
+    # ------------------------------------------------------------------
+
+    def load_class_plans(self, profile_file: str) -> List[ActiveClassPlan]:
+        """Parse the ``ClassPlans`` map of a profile file.
+
+        Every entry looks like::
+
+            "6f61ff96-…": {
+              "TimeLayoutId": "205e88c2-…",     # key into TimeLayouts
+              "TimeRule": {"WeekDay": 1, …},    # 0 = 周日 … 6 = 周六
+              "Name": "自习 周一", "IsEnabled": true, …
+            }
+
+        Never raises: an unreadable/missing file yields an empty list.
+        """
+        profiles_dir = self.profiles_dir
+        if profiles_dir is None:
+            return []
+
+        path = profiles_dir / profile_file
+        if not path.is_file():
+            stem_path = profiles_dir / f"{Path(profile_file).stem}.json"
+            if stem_path.is_file():
+                path = stem_path
+            else:
+                logger.warning("Profile not found for class plans: %s", path)
+                return []
+
+        data, _used_backup, _warning, error = self.load_json_with_backup(path)
+        if error is not None:
+            logger.warning("Cannot read class plans from %s: %s", path, error)
+            return []
+
+        container = _find_key(data, "ClassPlans", "class_plans", "ClassPlan")
+        if not isinstance(container, dict):
+            logger.info("Profile %s has no ClassPlans map", path.name)
+            return []
+
+        plans: List[ActiveClassPlan] = []
+        for plan_id, raw_plan in container.items():
+            if not isinstance(raw_plan, dict):
+                continue
+            layout_id = _find_key(raw_plan, "TimeLayoutId", "time_layout_id", "LayoutId")
+            if not isinstance(layout_id, str) or not layout_id.strip():
+                continue
+            rule = _find_key(raw_plan, "TimeRule", "time_rule")
+            weekday: Optional[int] = None
+            if isinstance(rule, dict):
+                raw_weekday = _find_key(rule, "WeekDay", "weekday", "WeekDayIndex")
+                try:
+                    weekday = int(raw_weekday) if raw_weekday is not None else None
+                except (TypeError, ValueError):
+                    weekday = None
+            name = _find_key(raw_plan, "Name", "name")
+            enabled = _find_key(raw_plan, "IsEnabled", "is_enabled")
+            plans.append(
+                ActiveClassPlan(
+                    plan_id=str(plan_id),
+                    name=str(name).strip() if isinstance(name, str) and name.strip() else f"课表 {str(plan_id)[:8]}",
+                    layout_id=layout_id.strip(),
+                    weekday=weekday,
+                    is_enabled=True if enabled is None else bool(enabled),
+                )
+            )
+        return plans
+
+    def active_class_plan(
+        self,
+        profile_file: Optional[str] = None,
+        day: Optional[date] = None,
+    ) -> Optional[ActiveClassPlan]:
+        """The class plan in use today, following ClassIsland's own rules.
+
+        Looks at ``Settings.json → SelectedProfile``, then that profile's
+        ``ClassPlans``, and picks the enabled plan whose ``TimeRule.WeekDay``
+        matches today (0 = 周日 … 6 = 周六).  Falls back to the first enabled
+        plan when nothing matches, so the comparison stays deterministic.
+        """
+        profile = profile_file or self.read_selected_profile()
+        if not profile:
+            return None
+
+        plans = self.load_class_plans(profile)
+        if not plans:
+            return None
+
+        wanted = classisland_weekday(day)
+        matching = [plan for plan in plans if plan.is_enabled and plan.weekday == wanted]
+        if not matching:
+            matching = [plan for plan in plans if plan.is_enabled] or plans
+
+        chosen = matching[0]
+        chosen.matches_day = chosen.weekday == wanted
+        return chosen
 
     def scan_all_layouts(self) -> List[TimeLayoutOption]:
         """Scan **every** ``Profiles/*.json`` and return all timetables.

@@ -37,6 +37,15 @@ class MessageType(str, Enum):
     RESEND_RESULT = "resend_result"
     FETCH_RECEIPTS = "fetch_receipts"
     RECEIPT_BATCH = "receipt_batch"
+    # --- 智能反转（家长只发 @机器人 时的纠错流程）---
+    #: 记录一条被 AI 判定为「不是转告」的消息（存为 ignored，不推送给客户端）
+    RECORD_IGNORED = "record_ignored"
+    #: 查询某位家长在最近 N 秒内最新的一条消息
+    RECENT_SENDER_MESSAGE = "recent_sender_message"
+    RECENT_SENDER_MESSAGE_RESULT = "recent_sender_message_result"
+    #: 把一条 ignored 的消息补发（改为未读，客户端下次同步即可看到）
+    FORWARD_MESSAGE = "forward_message"
+    FORWARD_RESULT = "forward_result"
 
 
 class MessagePriority(str, Enum):
@@ -48,6 +57,8 @@ class MessageStatus(str, Enum):
     UNREAD = "unread"
     READ = "read"
     RECALLED = "recalled"
+    #: 被 AI 过滤、未转发给客户端；仍留在库里，便于家长用 @机器人 反转为转发
+    IGNORED = "ignored"
 
 
 class ClientMode(str, Enum):

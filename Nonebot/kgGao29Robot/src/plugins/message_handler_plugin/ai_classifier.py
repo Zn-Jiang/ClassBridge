@@ -44,14 +44,21 @@ API_KEY_ENV_VAR = "DEEPSEEK_API_KEY"
 #: Sent verbatim with every request (see ``other/_test_ds.py``).
 _EXTRA_BODY: Dict[str, Any] = {"thinking": {"type": "disabled"}}
 
-SYSTEM_PROMPT = """你是一个家校群消息分类器。分析用户消息是否包含需要告知或提醒【学生】的事项（如带物、转告、请假、嘱咐等）。
-
+SYSTEM_PROMPT = """请分析用户消息是否包含需要告知或提醒【学生】的事项（如带物、转告、请假、嘱咐等），规则如下
 【绝对输出限制】
 你必须且只能输出一个数字：
 - 包含给学生的通知/提醒（即便混杂提问）：输出 1
 - 纯提问、纯寒暄、或给【老师/他人】的通知：输出 0
 
+【发送者身份】
+消息可能会附带发送者的群昵称以辅助你判断通知对象，通常是「学生名+关系」，例如「张三妈妈」。
+
 严禁输出任何其他字符、标点符号、解释或换行！只输出数字 1 或 0。"""
+
+#: 附带发送者群昵称（家长名字）时，用户消息的组装模板。
+#: 没有昵称时退化为纯消息内容，保持与旧版本一致。
+_USER_TEMPLATE_WITH_SENDER = "发送者群昵称：{sender}\n消息内容：{content}"
+_USER_TEMPLATE_PLAIN = "{content}"
 
 #: Values that mean "yes" / "no" when the model answers with words.
 _TRUE_WORDS = {"1", "true", "yes", "y", "真", "是"}
@@ -296,7 +303,25 @@ def _coerce_bool(value: Any) -> bool:
 # public classification API
 # ---------------------------------------------------------------------------
 
-async def classify_message(text: str, max_retries: int = 3) -> bool:
+def build_user_message(text: str, sender_name: Optional[str] = None) -> str:
+    """组装发给模型的用户消息（带上发送者群昵称作为身份线索）。
+
+    家长昵称一般是「学生名+关系」（张三妈妈/李四爸爸），把它一起交给模型，
+    模型才能判断消息里出现的孩子名字其实是她自己的孩子，而不是"在叫别人"。
+    """
+    content = (text or "").strip()
+    sender = (sender_name or "").strip()
+    if not sender:
+        return _USER_TEMPLATE_PLAIN.format(content=content)
+    return _USER_TEMPLATE_WITH_SENDER.format(sender=sender, content=content)
+
+
+async def classify_message(
+    text: str,
+    max_retries: int = 3,
+    *,
+    sender_name: Optional[str] = None,
+) -> bool:
     """Return ``True`` when *text* should be forwarded to the classroom client.
 
     Args:
@@ -304,6 +329,8 @@ async def classify_message(text: str, max_retries: int = 3) -> bool:
         max_retries: maximum number of attempts (at least 1).  A response that
             cannot be parsed counts as a failed attempt, matching the retry
             behaviour of ``other/_test_ds.py``.
+        sender_name: 发送者群昵称（通常是「张三妈妈」这种），作为身份线索一起
+            发给模型，避免家长称呼自己孩子时被误判成在叫别人。
 
     Returns:
         ``True``/``False`` on success, and ``False`` as a safe default once
@@ -318,6 +345,7 @@ async def classify_message(text: str, max_retries: int = 3) -> bool:
         logger.warning("AI classification skipped: api_key is empty")
         return False
 
+    user_content = build_user_message(content, sender_name)
     attempts = max(1, int(max_retries))
     for attempt in range(1, attempts + 1):
         try:
@@ -325,7 +353,7 @@ async def classify_message(text: str, max_retries: int = 3) -> bool:
                 model=_config["model"],
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": content},
+                    {"role": "user", "content": user_content},
                 ],
                 temperature=0.0,
                 max_tokens=15,

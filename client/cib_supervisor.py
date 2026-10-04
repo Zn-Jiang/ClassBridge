@@ -109,3 +109,51 @@ class CibSupervisor(QThread):
             )
             return False
         return self._confirm_result
+
+
+class BridgeRevival(QThread):
+    """Restart a zombie bridge off the GUI thread.
+
+    Used when the bridge answers ``capabilities`` but can no longer report a
+    lesson state (ClassIsland restarted underneath it).  Unlike
+    :class:`CibSupervisor` this *does* kill the existing listener, so it is
+    only ever pointed at a process :func:`cib_daemon.is_our_bridge` recognises.
+
+    Signals
+    -------
+    completed : object
+        Emitted once with the resulting :class:`cib_daemon.CibEnsureResult`.
+    """
+
+    completed = pyqtSignal(object)
+
+    def __init__(
+        self,
+        *,
+        exe_path: Optional[str] = None,
+        port: int = cib_daemon.CIB_PORT,
+        url: str = cib_daemon.CIB_WS_URL,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._exe_path = exe_path
+        self._port = port
+        self._url = url
+
+    def run(self) -> None:
+        try:
+            result = asyncio.run(
+                cib_daemon.revive_bridge(
+                    exe_path=self._exe_path,
+                    port=self._port,
+                    url=self._url,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Bridge revival failed: %s", exc)
+            result = cib_daemon.CibEnsureResult(
+                False,
+                cib_daemon.CibState.LAUNCH_FAILED,
+                f"桥接器重启线程异常：{exc}",
+            )
+        self.completed.emit(result)

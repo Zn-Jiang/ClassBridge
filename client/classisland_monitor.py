@@ -332,15 +332,27 @@ class ClassIslandMonitor(QThread):
             )
             return None, False
 
-        state = self._map_state_value(data.get("CurrentState"))
+        state = self._map_state_value(
+            data.get("CurrentState"), plan_loaded=data.get("IsClassPlanLoaded")
+        )
         if state is None:
             logger.debug("Unusable CurrentState value: %r", data.get("CurrentState"))
             return None, False
         return state, True
 
     @staticmethod
-    def _map_state_value(value: Any) -> Optional[bool]:
-        """Map a ``CurrentState`` string to break/class (``None`` = unknown)."""
+    def _map_state_value(value: Any, *, plan_loaded: Optional[bool] = None) -> Optional[bool]:
+        """把 ``CurrentState`` 映射成「是否下课」（``None`` = 无法判断）。
+
+        需要额外处理的几种取值（按用户要求）：
+
+        * ``BreakingTime`` / 含 ``break`` → 下课；
+        * ``AfterSchool``（放学）/ 含 ``after`` → 下课（放学同样可以弹窗）；
+        * 含 ``before``（第一节课之前）→ 下课；
+        * ``None``：课表已加载时表示「当前不在任何时间点内」，也就是**第一节上课前**或
+          **最后一节下课后** → 下課；课表未加载则说明桥接器读不到课，无法判断。
+        * ``OnClass`` → 上课。
+        """
         if not isinstance(value, str):
             return None
         text = value.strip().lower()
@@ -348,8 +360,15 @@ class ClassIslandMonitor(QThread):
             return None
         if _STATE_BREAK.lower() in text or "break" in text:
             return True
+        # 放学（AfterSchool）与第一节课之前都算下课
+        if "after" in text or "before" in text:
+            return True
         if "class" in text:
             return False
+        if text == "none":
+            # 课表已加载却返回 None：说明现在不在任何时间点内（早于第一节课或晚于
+            # 最后一节课），按需求应视为下课；否则无法判断，保持“不可用”。
+            return True if plan_loaded is True else None
         return None
 
     async def _query_current_state(self, websocket) -> Optional[bool]:

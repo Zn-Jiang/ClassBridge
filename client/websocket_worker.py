@@ -143,6 +143,9 @@ class ClientWorker(QThread):
         response = await self._send_request(
             websocket,
             MessageType.PENDING_MESSAGES,
+            # How far back history may go is decided by the *server*
+            # (``[server] history_window_days``), so a modified client cannot
+            # reach older records; the client only sets the page size.
             {"history_limit": 200},
         )
         if response.type == MessageType.PENDING_MESSAGES.value:

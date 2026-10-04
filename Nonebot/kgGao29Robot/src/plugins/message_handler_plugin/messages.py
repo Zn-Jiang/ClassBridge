@@ -17,6 +17,25 @@ HELP_TEXT = """可用指令：
 
 提示：执行 /查询 后，在短 ID 有效期内可直接发送"撤回 短ID"或"重发 短ID"，无需 @机器人。"""
 
+#: 智能反转：家长只发 @机器人（正文为空）时使用的提示
+REVERSE_WINDOW_SECONDS = 120
+REVERSE_NO_RECENT_TEXT = "最近 2 分钟内没有再收到您的消息，不知道要撤回还是转发。\n\n" + HELP_TEXT
+REVERSE_RECALLED_TEXT = "↩️ 已为您撤回上一条转告消息。"
+REVERSE_FORWARDED_TEXT = "已为您转发到客户端。"
+REVERSE_FAILED_TEXT = "操作失败：{reason}"
+
+
+def reverse_action_for_status(status: Optional[str]) -> str:
+    """根据「最近一条消息」的状态决定反转动作（纯函数，便于单测）。
+
+    * ``ignored``：这条消息被 AI 过滤、从未转发 → 补发（``forward``）；
+    * 其余状态（``unread`` 已转发未读、``read`` 已读、``recalled`` 已撤回、
+      以及未知值）：都交给服务端撤回接口，由它给出精确的拒绝理由（``recall``）。
+    """
+    if str(status or "").strip().lower() == "ignored":
+        return "forward"
+    return "recall"
+
 
 def parse_user_input(text: str) -> Dict[str, Optional[str]]:
     cleaned = (text or "").strip()

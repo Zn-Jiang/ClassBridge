@@ -111,6 +111,10 @@ class ServerConfig:
     admin_host: str = "0.0.0.0"
     admin_port: int = 8766
     admin_secret_token: str = ""
+    #: How far back the server hands out chat history (``pending_messages``).
+    #: Enforced **server side** so a modified client cannot reach older
+    #: records; ``0`` disables the window.
+    history_window_days: int = 30
 
 
 def load_server_config(config_path: Optional[Path] = None) -> ServerConfig:
@@ -171,6 +175,9 @@ def _server_config_from_unified(unified: Dict[str, Any]) -> ServerConfig:
         admin_host=_opt_str(section.get("admin_host"), defaults.admin_host),
         admin_port=int(section.get("admin_port") or defaults.admin_port),
         admin_secret_token=_opt_str(unified.get("admin_secret_token"), defaults.admin_secret_token),
+        history_window_days=int(
+            _opt_str(section.get("history_window_days"), defaults.history_window_days)
+        ),
     )
 
 
@@ -223,6 +230,9 @@ class ClientConfig:
     # ClassIsland ("CIB 时间表") be used as the fallback?  When disabled the
     # client degrades straight to the local JSON schedule.
     use_cib_schedule: bool = True
+    # When the ClassIsland timetable in use changes (another class plan became
+    # active), refresh the imported copy without asking.  Off = ask the user.
+    auto_refresh_schedule: bool = False
     # Optional explicit path to ClassIsland.WSBridge.exe (empty = auto-detect).
     cib_exe_path: str = ""
     classisland_ws_url: str = "ws://localhost:6614/"
@@ -285,6 +295,7 @@ def load_client_config(config_path: Optional[Path] = None) -> ClientConfig:
         )),
         cib_exe_path=_opt_str(section.get("cib_exe_path"), ClientConfig().cib_exe_path),
         use_cib_schedule=bool(section.get("use_cib_schedule", ClientConfig().use_cib_schedule)),
+        auto_refresh_schedule=bool(section.get("auto_refresh_schedule", ClientConfig().auto_refresh_schedule)),
         classisland_ws_url=_opt_str(section.get("classisland_ws_url"), ClientConfig().classisland_ws_url),
         ntp_server=_opt_str(section.get("ntp_server"), ClientConfig().ntp_server),
         auto_popup_on_break=bool(section.get("auto_popup_on_break", ClientConfig().auto_popup_on_break)),
@@ -334,6 +345,7 @@ def _dump_client_toml(config: ClientConfig) -> str:
         f"break_popup_delay_seconds = {config.break_popup_delay_seconds}",
         f'cib_exe_path = "{_esc(config.cib_exe_path)}"',
         f"use_cib_schedule = {_bool_str(config.use_cib_schedule)}",
+        f"auto_refresh_schedule = {_bool_str(config.auto_refresh_schedule)}",
         f'classisland_ws_url = "{_esc(config.classisland_ws_url)}"',
         f'ntp_server = "{_esc(config.ntp_server)}"',
         f"auto_popup_on_break = {_bool_str(config.auto_popup_on_break)}",

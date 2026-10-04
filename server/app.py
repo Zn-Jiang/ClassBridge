@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import logging
 from json import dumps
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
@@ -28,7 +29,11 @@ class ServerApplication:
         # Unified config.toml (active environment applied); legacy server.toml
         # is only used when config.toml is missing.
         self.config = load_server_config()
-        self.logger = configure_logging("kg.server", "server.log", self.config.log_level)
+        # ``debug_mode`` of the active environment now has a real effect: it
+        # turns on verbose (DEBUG) logging, which is exactly what the admin
+        # console's log page needs when something is misbehaving.
+        log_level = "DEBUG" if self.config.debug_mode else self.config.log_level
+        self.logger = configure_logging("kg.server", "server.log", log_level)
         self.database = Database(self.config)
         self.short_ids = ShortIdStore()
         self.service = ServerService(self.config, self.database, self.short_ids)
@@ -62,6 +67,7 @@ class ServerApplication:
         old = self.config
         self.config = new_config
         self.service.update_config(new_config)
+        self._apply_log_level()
 
         self.logger.info(
             "Config hot-reloaded: active_env=%s, token=%s…, short_id_ttl=%ss",
@@ -79,6 +85,22 @@ class ServerApplication:
             )
         if old.database_path != new_config.database_path:
             self.logger.warning("database_path 已变更，需重启服务端才能生效")
+
+    def _apply_log_level(self) -> None:
+        """Keep the log level in sync with ``debug_mode`` / ``log_level``.
+
+        Applied on hot-reload too, so toggling 调试模式 in the console takes
+        effect without restarting the server.
+        """
+        level_name = "DEBUG" if self.config.debug_mode else self.config.log_level
+        level = getattr(logging, str(level_name).upper(), logging.INFO)
+        self.logger.setLevel(level)
+        for handler in self.logger.handlers:
+            handler.setLevel(level)
+        logger = logging.getLogger("kg.server.admin_api")
+        logger.setLevel(level)
+        for handler in logger.handlers:
+            handler.setLevel(level)
 
     def on_config_saved(self, saved: Dict[str, Any]) -> None:
         """Called from the Flask thread after a successful save.

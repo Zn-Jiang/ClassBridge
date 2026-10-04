@@ -119,7 +119,14 @@ class Database:
         timestamp: Optional[str],
         group_id: Optional[str],
         source_message_id: Optional[int],
+        status: MessageStatus = MessageStatus.UNREAD,
     ) -> StoredMessageResult:
+        """写入一条消息。
+
+        ``status`` 默认未读（即转发给客户端）；智能反转需要把被 AI 过滤掉的
+        消息也留在库里，此时传 ``MessageStatus.IGNORED``——它不会出现在客户端的
+        未读或历史里，但家长可以用 @机器人 让服务端补发。
+        """
         with self.session() as session:
             model = MessageModel(
                 group_id=group_id,
@@ -127,7 +134,7 @@ class Database:
                 sender_name=sender_name,
                 content=content,
                 msg_type=msg_type.value,
-                status=MessageStatus.UNREAD.value,
+                status=status.value,
                 resend_count=0,
                 timestamp=_parse_timestamp(timestamp),
                 source_message_id=source_message_id,
@@ -168,22 +175,73 @@ class Database:
             )
             return [_to_message_record(item) for item in session.execute(stmt).scalars().all()]
 
-    def list_recent_messages(self, limit: int = 200) -> list[MessageRecord]:
+    def list_recent_messages(
+        self,
+        limit: int = 200,
+        since: Optional[datetime] = None,
+    ) -> list[MessageRecord]:
+        """Recent messages, newest first.
+
+        ``since`` restricts the result to messages at least that new; the
+        client asks for its configured window (30 days by default) so a fresh
+        client never pulls months of history over the wire.
+        """
         with self.session() as session:
-            stmt = (
-                select(MessageModel)
-                .order_by(
-                    func.coalesce(MessageModel.resend_time, MessageModel.timestamp).desc(),
-                    MessageModel.id.desc(),
+            stmt = select(MessageModel)
+            # ignored 是“AI 判定不是转告”的消息，从未发给客户端，历史里也不该出现
+            stmt = stmt.where(MessageModel.status != MessageStatus.IGNORED.value)
+            if since is not None:
+                stmt = stmt.where(
+                    func.coalesce(MessageModel.resend_time, MessageModel.timestamp) >= since
                 )
-                .limit(limit)
-            )
+            stmt = stmt.order_by(
+                func.coalesce(MessageModel.resend_time, MessageModel.timestamp).desc(),
+                MessageModel.id.desc(),
+            ).limit(limit)
             return [_to_message_record(item) for item in session.execute(stmt).scalars().all()]
 
     def get_message(self, db_id: int) -> Optional[MessageRecord]:
         with self.session() as session:
             model = session.get(MessageModel, db_id)
             return None if model is None else _to_message_record(model)
+
+    def latest_message_for_sender(
+        self,
+        sender_id: str,
+        *,
+        since: Optional[datetime] = None,
+        include_ignored: bool = True,
+    ) -> Optional[MessageRecord]:
+        """某位家长最近的一条消息（智能反转用它决定撤回还是补发）。
+
+        ``since`` 用于限定时间窗口（默认由调用方给 120 秒）；``include_ignored``
+        必须为真才能看到被 AI 过滤的消息——否则家长无法把误判的消息补发出去。
+        """
+        with self.session() as session:
+            stmt = select(MessageModel).where(MessageModel.sender_id == str(sender_id))
+            if since is not None:
+                stmt = stmt.where(
+                    func.coalesce(MessageModel.resend_time, MessageModel.timestamp) >= since
+                )
+            if not include_ignored:
+                stmt = stmt.where(MessageModel.status != MessageStatus.IGNORED.value)
+            stmt = stmt.order_by(
+                func.coalesce(MessageModel.resend_time, MessageModel.timestamp).desc(),
+                MessageModel.id.desc(),
+            ).limit(1)
+            model = session.execute(stmt).scalars().first()
+            return None if model is None else _to_message_record(model)
+
+    def set_message_status(self, db_id: int, status: MessageStatus) -> Optional[MessageRecord]:
+        """直接改消息状态（智能反转把 ignored 补发成 unread 时会用到）。"""
+        with self.session() as session:
+            model = session.get(MessageModel, db_id)
+            if model is None:
+                return None
+            model.status = status.value
+            session.commit()
+            session.refresh(model)
+            return _to_message_record(model)
 
     def recall_message(self, db_id: int) -> Optional[MessageRecord]:
         with self.session() as session:

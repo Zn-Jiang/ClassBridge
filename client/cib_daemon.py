@@ -38,6 +38,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -55,6 +56,13 @@ logger = logging.getLogger("kg.client.cib_daemon")
 #: Executable name of the bridge program (used for launching and diagnostics,
 #: **never** as the sole availability check).
 CIB_PROCESS_NAME = "ClassIsland.WSBridge.exe"
+#: Prefix matched (case-insensitively) when looking for *a* bridge process.
+#:
+#: ClassIsland's own release names the file after the version — e.g.
+#: ``ClassIsland.WSBridge_v2.0_win-x64.exe`` — so an exact match on
+#: :data:`CIB_PROCESS_NAME` misses real installations (and would refuse to
+#: restart them).
+CIB_PROCESS_PREFIX = "classisland.wsbridge"
 #: Port the bridge listens on.
 CIB_PORT = 6614
 #: WebSocket endpoint exposed by CIB 2.0 (the listener serves the root path).
@@ -197,11 +205,25 @@ def client_directory() -> Path:
     return Path(__file__).resolve().parent
 
 
+def looks_like_bridge_name(name: object) -> bool:
+    """Whether a process name looks like a ClassIsland bridge build.
+
+    Matches ``ClassIsland.WSBridge.exe`` as well as versioned release names such
+    as ``ClassIsland.WSBridge_v2.0_win-x64.exe``.
+    """
+    text = str(name or "").strip().lower()
+    if not text:
+        return False
+    return text.startswith(CIB_PROCESS_PREFIX) or text == CIB_PROCESS_NAME.lower()
+
+
 def cib_search_paths(configured_path: Optional[str] = None) -> List[Path]:
-    """Every location consulted for ``ClassIsland.WSBridge.exe``, in order.
+    """Every location consulted for the bridge executable, in order.
 
     Used only when the bridge has to be *launched*; availability itself is
-    decided by :func:`probe_bridge`.
+    decided by :func:`probe_bridge`.  Besides the exact
+    ``ClassIsland.WSBridge.exe`` name, versioned release builds
+    (``ClassIsland.WSBridge_v2.0_win-x64.exe``, …) are accepted.
     """
     candidates: List[Path] = []
 
@@ -221,6 +243,8 @@ def cib_search_paths(configured_path: Optional[str] = None) -> List[Path]:
     project_root = get_project_root()
     candidates.append(project_root / "bin" / CIB_PROCESS_NAME)
     candidates.append(project_root / CIB_PROCESS_NAME)
+    # The standalone bridge project keeps versioned builds in its Release dir.
+    candidates.append(project_root / "classisland-ws-bridge" / "Release" / "v2.0" / CIB_PROCESS_NAME)
 
     unique: List[Path] = []
     for candidate in candidates:
@@ -229,8 +253,67 @@ def cib_search_paths(configured_path: Optional[str] = None) -> List[Path]:
     return unique
 
 
+def _version_score(path: Path) -> Tuple[int, ...]:
+    """Extract ``ClassIsland.WSBridge_v2.0_…`` style version numbers from a name."""
+    match = re.search(r"_v(\d+(?:\.\d+)*)", path.stem, re.IGNORECASE)
+    if match is None:
+        return (0,)
+    try:
+        return tuple(int(part) for part in match.group(1).split("."))
+    except ValueError:  # pragma: no cover - defensive
+        return (0,)
+
+
+def find_bridge_executable(configured_path: Optional[str] = None) -> Optional[Path]:
+    """Locate a launchable bridge binary, accepting versioned release names.
+
+    An explicitly configured path always wins.  Otherwise the newest build is
+    preferred (higher version marker first, then most recently modified), so a
+    stale ``client/bin/ClassIsland.WSBridge.exe`` never shadows a v2 release.
+    """
+    if configured_path:
+        configured = Path(configured_path)
+        if configured.is_file():
+            return configured
+        logger.warning("Configured cib_exe_path does not exist: %s", configured_path)
+
+    candidates: List[Path] = []
+    for candidate in cib_search_paths(None):
+        if candidate.is_file() and candidate not in candidates:
+            candidates.append(candidate)
+
+    directories: List[Path] = [
+        client_directory() / "bin",
+        client_directory(),
+        get_project_root() / "bin",
+        get_project_root(),
+        get_project_root() / "classisland-ws-bridge" / "Release" / "v2.0",
+    ]
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.exe")):
+            if path.is_file() and looks_like_bridge_name(path.name) and path not in candidates:
+                candidates.append(path)
+
+    if not candidates:
+        return None
+
+    best = max(
+        candidates,
+        key=lambda path: (_version_score(path), path.stat().st_mtime),
+    )
+    if len(candidates) > 1:
+        logger.info(
+            "Multiple bridge builds found (%s); using %s",
+            ", ".join(f"{path.name}@{_version_score(path)[0]}" for path in candidates),
+            best.name,
+        )
+    return best
+
+
 def get_cib_executable_path(configured_path: Optional[str] = None) -> Path:
-    """Locate ``ClassIsland.WSBridge.exe`` (needed to *start* the bridge).
+    """Locate the bridge executable (needed to *start* the bridge).
 
     Resolution order (see :func:`cib_search_paths`):
 
@@ -238,15 +321,16 @@ def get_cib_executable_path(configured_path: Optional[str] = None) -> Path:
     2. ``<client>/bin/ClassIsland.WSBridge.exe`` — the self-contained layout.
     3. ``<client>/ClassIsland.WSBridge.exe`` — next to the client code.
     4. ``<project root|exe dir>/bin/`` and ``<project root|exe dir>/``.
-    5. ``sys._MEIPASS/…`` for frozen single-file builds.
+    5. ``<project root>/classisland-ws-bridge/Release/v2.0/`` (this repo's build output).
+    6. ``sys._MEIPASS/…`` for frozen single-file builds.
+    7. Any ``ClassIsland.WSBridge*.exe`` in those directories (versioned builds).
 
     Raises:
         FileNotFoundError: when none of the candidates exists.
     """
-    for candidate in cib_search_paths(configured_path):
-        if candidate.is_file():
-            logger.debug("Using CIB at %s", candidate)
-            return candidate
+    found = find_bridge_executable(configured_path)
+    if found is not None:
+        return found
 
     if configured_path:
         logger.warning("Configured cib_exe_path does not exist: %s", configured_path)
@@ -272,22 +356,42 @@ def is_classisland_running() -> Optional[bool]:
 
 
 def is_bridge_process_running() -> bool:
-    """Whether a process named ``ClassIsland.WSBridge.exe`` exists.
+    """Whether a bridge process exists (versioned names included).
 
     Diagnostics only — a renamed build would make this return ``False`` even
     though the bridge works, so never base availability on it.
     """
+    return find_bridge_process() is not None
+
+
+def find_bridge_process() -> Optional[Tuple[str, int]]:
+    """Return ``(name, pid)`` of a running bridge process, if any.
+
+    Prefers the *process* over the port owner: on Windows the listening socket
+    of an elevated process is sometimes attributed to PID 4 (``System``), which
+    makes port-based identification unusable for restarting our own bridge.
+
+    Uses the cheap Win32 snapshot when possible so the watchdog-style polling
+    never turns into a UI stutter (see ``client/win_process.py``).
+    """
+    from . import win_process
+
+    if win_process.available():
+        found = win_process.find_pid_by_prefix(CIB_PROCESS_PREFIX)
+        if found is not None:
+            return str(found[1]), int(found[0])
+        return None
+
     try:
-        for process in psutil.process_iter(["name"]):
+        for process in psutil.process_iter(["name", "pid"]):
             try:
-                name = str(process.info.get("name") or "")
-                if name.lower() == CIB_PROCESS_NAME.lower():
-                    return True
+                if looks_like_bridge_name(process.info.get("name")):
+                    return str(process.info.get("name")), int(process.info["pid"])
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("Failed to enumerate processes while looking for CIB: %s", exc)
-    return False
+    return None
 
 
 def find_port_holder(port: int = CIB_PORT) -> Optional[Tuple[str, int]]:
@@ -657,6 +761,180 @@ async def ensure_cib_running(
         conflict_process=conflict_process,
         conflict_pid=conflict_pid,
         killed_pid=killed_pid,
+    )
+
+
+def is_our_bridge(name: str, pid: int, executable: Optional[Path] = None) -> bool:
+    """Whether the process listening on the bridge port may be restarted by us.
+
+    Deliberately conservative: we only ever kill a bridge, never an unknown
+    process that happens to hold the port.  ``ClassIsland.WSBridge.exe`` and
+    versioned builds (``ClassIsland.WSBridge_v2.0_win-x64.exe``) are ours; a
+    ``System``/``svchost`` listener is not.
+    """
+    if looks_like_bridge_name(name):
+        return True
+    if executable is not None and str(name).lower() == executable.name.lower():
+        return True
+    try:
+        actual = Path(psutil.Process(pid).exe()).resolve()
+    except Exception:
+        return False
+    if executable is not None and actual == executable.resolve():
+        return True
+    return looks_like_bridge_name(actual.name)
+
+
+async def revive_bridge(
+    *,
+    exe_path: Optional[str] = None,
+    port: int = CIB_PORT,
+    url: str = CIB_WS_URL,
+) -> CibEnsureResult:
+    """Restart a **zombie** bridge so it re-attaches to ClassIsland's IPC.
+
+    A bridge that was running when ClassIsland restarted keeps answering
+    ``capabilities`` (a static manifest) but its IPC link is gone: every lesson
+    property becomes its default and ``CurrentState`` is the enum default
+    ``None`` forever.  :func:`ensure_cib_running` sees a usable-looking bridge
+    and does nothing, which is why such a zombie used to persist until the
+    classroom PC was rebooted.
+
+    Steps: ClassIsland must be running → the port holder must be a bridge →
+    kill it → wait for the port to be released → launch a fresh bridge → wait
+    for it to answer again.
+
+    The caller is responsible for rate limiting (see the window's cooldown);
+    this function always performs one restart attempt.
+    """
+    if is_classisland_running() is False:
+        return CibEnsureResult(
+            False,
+            CibState.CLASSISLAND_NOT_RUNNING,
+            "未检测到 ClassIsland 进程，重启桥接器也无法恢复。",
+        )
+
+    try:
+        executable = get_cib_executable_path(exe_path)
+    except FileNotFoundError as exc:
+        logger.error("%s", exc)
+        return CibEnsureResult(
+            False,
+            CibState.EXECUTABLE_MISSING,
+            f"{exc} 无法自动重启桥接器。",
+        )
+
+    # Relaunch *the same build that is running* when possible: the discovery
+    # order may find an older copy (e.g. a stale ``client/bin`` binary) and
+    # starting a different version than the one in use would be surprising.
+    running = find_bridge_process()
+    if running is not None:
+        try:
+            running_exe = Path(psutil.Process(running[1]).exe())
+            if running_exe.is_file():
+                if running_exe.resolve() != executable.resolve():
+                    logger.info(
+                        "Restarting with the running bridge build %s (discovery found %s)",
+                        running_exe,
+                        executable,
+                    )
+                executable = running_exe
+        except Exception as exc:
+            logger.debug("Cannot read the running bridge's path (%s); using %s", exc, executable)
+
+    holder = find_port_holder(port)
+    killed_pid: Optional[int] = None
+    conflict_process: Optional[str] = None
+    conflict_pid: Optional[int] = None
+
+    # Prefer the *process* over the port owner: Windows sometimes attributes an
+    # elevated process's listening socket to PID 4 (System), and there is no
+    # point refusing a restart because of that.
+    process_holder = running
+    if process_holder is not None:
+        holder = process_holder
+
+    if holder is not None:
+        name, pid = holder
+        if not is_our_bridge(name, pid, executable):
+            logger.warning(
+                "Port %s is held by %s (PID %s), which does not look like our bridge; "
+                "refusing to restart it",
+                port,
+                name,
+                pid,
+            )
+            return CibEnsureResult(
+                False,
+                CibState.PORT_CONFLICT_DECLINED,
+                f"端口 {port} 被 {name} (PID: {pid}) 占用，且它不像桥接器，不自动重启。"
+                f"（若是权限导致的误报，可在设置里手动重启桥接器）",
+                conflict_process=name,
+                conflict_pid=pid,
+                exe_path=executable,
+            )
+
+        conflict_process, conflict_pid = name, pid
+        logger.warning("Restarting unresponsive bridge %s (PID %s)", name, pid)
+        if not kill_process(pid):
+            return CibEnsureResult(
+                False,
+                CibState.LAUNCH_FAILED,
+                f"无法结束旧的桥接器进程 {name} (PID: {pid})。",
+                conflict_process=name,
+                conflict_pid=pid,
+                exe_path=executable,
+            )
+        killed_pid = pid
+        if not await _wait_for_port_release(port):
+            return CibEnsureResult(
+                False,
+                CibState.LAUNCH_FAILED,
+                f"结束旧桥接器后端口 {port} 仍被占用。",
+                conflict_process=name,
+                conflict_pid=pid,
+                killed_pid=killed_pid,
+                exe_path=executable,
+            )
+
+    process = launch_cib(executable)
+    if process is None:
+        return CibEnsureResult(
+            False,
+            CibState.LAUNCH_FAILED,
+            "重启 ClassIsland 桥接器失败。",
+            killed_pid=killed_pid,
+            exe_path=executable,
+            conflict_process=conflict_process,
+            conflict_pid=conflict_pid,
+        )
+
+    probe = await wait_for_bridge(_STARTUP_READY_TIMEOUT_SECONDS, url)
+    if not probe.ok:
+        logger.warning("Restarted CIB (pid=%s) but it is still not ready: %s", process.pid, probe.describe())
+        return CibEnsureResult(
+            False,
+            CibState.LAUNCH_TIMEOUT,
+            f"已重启桥接器 (PID: {process.pid})，但等待就绪超时：{probe.describe()}",
+            probe=probe,
+            process=process,
+            exe_path=executable,
+            killed_pid=killed_pid,
+            conflict_process=conflict_process,
+            conflict_pid=conflict_pid,
+        )
+
+    logger.info("Bridge restarted and answering again (pid=%s)", process.pid)
+    return CibEnsureResult(
+        True,
+        CibState.LAUNCHED,
+        f"已重启 ClassIsland 桥接器 (PID: {process.pid})，正在等待它重新连接 ClassIsland。",
+        probe=probe,
+        process=process,
+        exe_path=executable,
+        killed_pid=killed_pid,
+        conflict_process=conflict_process,
+        conflict_pid=conflict_pid,
     )
 
 

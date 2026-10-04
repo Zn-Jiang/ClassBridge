@@ -52,6 +52,10 @@ client_name = "classroom-desktop"
 # 并建议在防火墙中限制来源 IP）；仅本机使用可改为 127.0.0.1
 admin_host = "0.0.0.0"
 admin_port = 8766
+# 服务端最多向客户端提供多少天的聊天历史（0 = 不限制）。
+# 这是**服务端策略**：客户端即使请求更久远，也会被服务端收窄，
+# 因此改 client.toml 无法绕过（本地已有的历史记录不受影响，照常显示）。
+history_window_days = 30
 
 [plugin]
 bot_name = "kgGao29MessageBot"

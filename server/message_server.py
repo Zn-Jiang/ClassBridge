@@ -27,13 +27,16 @@ from __future__ import annotations
 
 import hmac
 import logging
+import re
 import threading
-from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, request
 
 from shared.config import ServerConfig, load_server_config
 from shared.config_manager import ConfigManager, get_config_manager
+from shared.paths import LOG_DIR
 
 logger = logging.getLogger("kg.server.admin_api")
 
@@ -42,6 +45,12 @@ _PROTECTED_PREFIX = "/api/sys_mgmt/"
 
 #: Settings that only take effect after restarting the server.
 _RESTART_ONLY_KEYS = ("server_host", "server_port", "admin_host", "admin_port")
+
+#: Log levels the console may filter on.
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+#: Upper bound on bytes read from the end of the log file (keeps the endpoint
+#: cheap even when the file has grown for months).
+_LOG_TAIL_BYTES = 512 * 1024
 
 ConfigSavedHook = Callable[[Dict[str, Any]], None]
 
@@ -119,6 +128,90 @@ def install_cors(app: Flask) -> str:
         return None
 
     return "builtin"
+
+
+# ---------------------------------------------------------------------------
+# log tail parsing
+# ---------------------------------------------------------------------------
+
+#: ``shared.logging_utils`` writes ``%(asctime)s | %(levelname)s | %(name)s | %(message)s``.
+_LOG_LINE_RE = re.compile(
+    r"^(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \| "
+    r"(?P<level>[A-Z]+) \| "
+    r"(?P<name>[^|]+?) \| "
+    r"(?P<message>.*)$"
+)
+
+
+def log_file_path() -> Path:
+    """The server log the admin console tails."""
+    return Path(LOG_DIR) / "server.log"
+
+
+def parse_log_text(text: str) -> List[Dict[str, str]]:
+    """Parse log text into entries (newest **first**).
+
+    Continuation lines (tracebacks, multi-line messages) are appended to the
+    entry they belong to instead of being dropped.
+    """
+    entries: List[Dict[str, str]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip("\r")
+        if not line.strip():
+            continue
+        match = _LOG_LINE_RE.match(line)
+        if match is None:
+            if entries:
+                entries[-1]["message"] += "\n" + line
+            continue
+        entries.append(
+            {
+                "time": match.group("time"),
+                "level": match.group("level").upper(),
+                "name": match.group("name").strip(),
+                "message": match.group("message"),
+            }
+        )
+    entries.reverse()
+    return entries
+
+
+def read_log_entries(
+    *,
+    limit: int = 300,
+    levels: Optional[List[str]] = None,
+    search: Optional[str] = None,
+    path: Optional[Path] = None,
+) -> tuple:
+    """Read the log tail, filter it and return ``(entries, path, truncated)``."""
+    target = Path(path) if path is not None else log_file_path()
+    if not target.is_file():
+        return [], target, False
+
+    size = target.stat().st_size
+    truncated = size > _LOG_TAIL_BYTES
+    with target.open("r", encoding="utf-8", errors="replace") as handle:
+        if truncated:
+            handle.seek(size - _LOG_TAIL_BYTES)
+            handle.readline()  # drop the partial first line
+        text = handle.read()
+
+    entries = parse_log_text(text)
+
+    wanted = {level.upper() for level in levels} if levels else None
+    needle = search.lower() if search else None
+    selected: List[Dict[str, str]] = []
+    for entry in entries:
+        if wanted is not None and entry["level"] not in wanted:
+            continue
+        if needle is not None:
+            haystack = f"{entry['name']} {entry['message']}".lower()
+            if needle not in haystack:
+                continue
+        selected.append(entry)
+        if len(selected) >= limit:
+            break
+    return selected, target, truncated
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +328,55 @@ def create_admin_app(
                 "config": saved,
                 "revision": manager.revision,
                 "restart_required": restart_required,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # GET /api/sys_mgmt/logs
+    # ------------------------------------------------------------------
+
+    @app.get("/api/sys_mgmt/logs")
+    def get_logs():  # type: ignore[unused-ignore]
+        """Tail of the server log, newest entry first.
+
+        Query parameters:
+            limit:  maximum number of entries (default 300, max 2000)
+            levels: comma-separated level names to keep (default: all)
+            search: case-insensitive substring filter on the message
+        """
+        limit_raw = request.args.get("limit", "300")
+        try:
+            limit = max(1, min(2000, int(limit_raw)))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "limit 必须是整数"}), 400
+
+        levels = [
+            item.strip().upper()
+            for item in (request.args.get("levels") or "").split(",")
+            if item.strip()
+        ]
+        invalid = [level for level in levels if level not in LOG_LEVELS]
+        if invalid:
+            return jsonify({"ok": False, "error": f"未知日志等级：{', '.join(invalid)}"}), 400
+
+        search = (request.args.get("search") or "").strip()
+
+        try:
+            entries, path, truncated = read_log_entries(
+                limit=limit, levels=levels or None, search=search or None
+            )
+        except Exception as exc:
+            logger.exception("读取日志失败")
+            return jsonify({"ok": False, "error": f"读取日志失败：{exc}"}), 500
+
+        return jsonify(
+            {
+                "ok": True,
+                "entries": entries,
+                "count": len(entries),
+                "path": str(path),
+                "truncated": truncated,
+                "available_levels": LOG_LEVELS,
             }
         )
 

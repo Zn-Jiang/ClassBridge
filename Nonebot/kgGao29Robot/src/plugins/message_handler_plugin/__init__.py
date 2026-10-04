@@ -26,12 +26,18 @@ from .ai_classifier import (
 from .config import Config, merge_with_plugin_config
 from .messages import (
     HELP_TEXT,
+    REVERSE_FAILED_TEXT,
+    REVERSE_FORWARDED_TEXT,
+    REVERSE_NO_RECENT_TEXT,
+    REVERSE_RECALLED_TEXT,
+    REVERSE_WINDOW_SECONDS,
     build_operation_feedback,
     build_query_feedback,
     build_server_error_feedback,
     build_store_feedback,
     current_timestamp_text,
     parse_user_input,
+    reverse_action_for_status,
 )
 from .server_api import ServerApiError, send_request
 
@@ -249,21 +255,115 @@ async def handle_ai_classify(bot: Bot, event: MessageEvent) -> None:
         return
 
     logger.info(
-        "AI classify: user=%s group=%s content=%r",
+        "AI classify: user=%s name=%r group=%s content=%r",
         event.user_id,
+        _sender_name(event),
         event.group_id,
         content[:80],
     )
 
     # The classifier uses the module-level client configured at start-up.
-    is_notification = await classify_message(content)
+    # 带上发送者群昵称（如「张三妈妈」），避免家长称呼自己孩子时被误判成在叫别人。
+    is_notification = await classify_message(content, sender_name=_sender_name(event))
 
     if not is_notification:
-        logger.info("AI classify: NOT a notification, skipping")
+        # 记进库里（状态 ignored）但不转发：家长随后只发 @机器人 就能把它补发出去
+        logger.info("AI classify: NOT a notification, recorded as ignored")
+        await _record_ignored(bot, event, content)
         return
 
     logger.info("AI classify: IS a notification, auto-forwarding")
     await _auto_forward(bot, event, content)
+
+
+async def _record_ignored(bot: Bot, event: GroupMessageEvent, content: str) -> None:
+    """把被 AI 判定为「不是转告」的消息记进服务端（状态 ignored，不推送）。
+
+    记录的目的是让家长可以用「只发 @机器人」把它补发出去；失败只记日志，
+    绝不能影响正常流程。
+    """
+    try:
+        await send_request(
+            config,
+            MessageType.RECORD_IGNORED,
+            data={
+                "sender_id": str(event.user_id),
+                "sender_name": _sender_name(event),
+                "content": content,
+                "msg_type": MessagePriority.NORMAL.value,
+                "timestamp": current_timestamp_text(),
+                "group_id": str(event.group_id),
+                "source_message_id": getattr(event, "message_id", None),
+            },
+        )
+    except Exception as exc:  # 记录失败不影响家长体验
+        logger.warning("记录被过滤消息失败：%s", exc)
+
+
+async def _handle_reverse(bot: Bot, event: GroupMessageEvent) -> None:
+    """智能反转：家长只发 @机器人（正文为空）时的纠错流程。
+
+    规则（时间窗口 REVERSE_WINDOW_SECONDS，默认 120 秒）：
+
+    * 窗口内没有消息 → 按「@了机器人但没输指令」处理，回复帮助文档；
+    * 最近一条是「已转发」→ 撤回它，回复"已为您撤回上一条转告消息"；
+    * 最近一条是「被 AI 过滤」→ 补发到客户端，回复"已为您转发到客户端"。
+    """
+    try:
+        response = await send_request(
+            config,
+            MessageType.RECENT_SENDER_MESSAGE,
+            data={
+                "sender_id": str(event.user_id),
+                "window_seconds": REVERSE_WINDOW_SECONDS,
+            },
+        )
+    except ServerApiError as exc:
+        await _reply(bot, event, REVERSE_FAILED_TEXT.format(reason=exc))
+        return
+
+    record = response.get("record")
+    if not record:
+        logger.info("智能反转：%s 在 %s 秒内没有消息，回复帮助", event.user_id, REVERSE_WINDOW_SECONDS)
+        await _reply(bot, event, REVERSE_NO_RECENT_TEXT)
+        return
+
+    db_id = record.get("db_id")
+    status = str(record.get("status") or "")
+    action = reverse_action_for_status(status)
+    logger.info("智能反转：user=%s db_id=%s status=%s action=%s", event.user_id, db_id, status, action)
+
+    if action == "forward":
+        # 被 AI 过滤掉的消息 → 补发（服务端改为未读，客户端下次同步即可看到）
+        try:
+            result = await send_request(
+                config,
+                MessageType.FORWARD_MESSAGE,
+                data={"db_id": db_id},
+            )
+        except ServerApiError as exc:
+            await _reply(bot, event, REVERSE_FAILED_TEXT.format(reason=exc))
+            return
+        if not result.get("ok", False):
+            await _reply(bot, event, REVERSE_FAILED_TEXT.format(reason=result.get("message", "未知错误")))
+            return
+        await _reply(bot, event, REVERSE_FORWARDED_TEXT)
+        return
+
+    # 其余状态（未读 / 已读 / 已撤回）都走撤回接口，由服务端给出具体原因
+    try:
+        result = await send_request(
+            config,
+            MessageType.RECALL_MESSAGE,
+            data={"db_id": db_id, "sender_id": str(event.user_id)},
+        )
+    except ServerApiError as exc:
+        await _reply(bot, event, REVERSE_FAILED_TEXT.format(reason=exc))
+        return
+    if result.get("ok", False):
+        await _reply(bot, event, REVERSE_RECALLED_TEXT)
+        return
+    await _reply(bot, event, REVERSE_FAILED_TEXT.format(reason=result.get("message", "未知错误")))
 
 
 async def _auto_forward(bot: Bot, event: GroupMessageEvent, content: str) -> None:
@@ -327,6 +427,11 @@ async def handle_message(bot: Bot, event: MessageEvent) -> None:
     kind = parsed["kind"]
 
     if kind in {"empty", "help"}:
+        if kind == "empty" and isinstance(event, GroupMessageEvent):
+            # 只发了一个 @机器人（正文为空）→ 智能反转：按最近一条消息的状态
+            # 决定是撤回还是补发（详见 _handle_reverse）
+            await _handle_reverse(bot, event)
+            return
         await _reply(bot, event, HELP_TEXT)
         return
     if kind == "query":
