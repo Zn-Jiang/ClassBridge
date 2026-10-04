@@ -75,3 +75,4 @@ other/
 classisland-ws-bridge/
 sync_to_server
 admin
+pack_sync.py
