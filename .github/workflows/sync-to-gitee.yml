@@ -17,4 +17,4 @@ jobs:
       - name: Push to Gitee
         run: |
           git remote add gitee https://wang-zini:${{ secrets.GITEE_TOKEN }}@gitee.com/wang-zini/ClassBridge.git
-          git push -f gitee main:main
+          git push -f gitee HEAD:${{ github.ref_name }}
