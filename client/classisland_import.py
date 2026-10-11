@@ -135,6 +135,8 @@ class ActiveClassPlan:
     plan_id: str
     name: str
     layout_id: str
+    #: ``TimeLayout`` 的名字（"时间表名"，界面上显示这个；``name`` 是课程表名）
+    layout_name: str = ""
     #: ``TimeRule.WeekDay`` — 0 = 周日, 1 = 周一 … 6 = 周六 (ClassIsland's own convention).
     weekday: Optional[int] = None
     is_enabled: bool = True
@@ -145,6 +147,15 @@ class ActiveClassPlan:
     def label(self) -> str:
         day = "周日周一二三四五六"[self.weekday] if self.weekday is not None else "?"
         return f"{self.name}（{day}）" if self.weekday is not None else self.name
+
+    @property
+    def display_name(self) -> str:
+        """给用户看的名字：优先「时间表名」（TimeLayout.Name）。
+
+        用户在 ClassIsland 里切换的是时间表，所以界面/提示里应当显示时间表名；
+        读不到时退回课程表名（ClassPlan.Name），保证提示不为空。
+        """
+        return self.layout_name or self.name
 
 
 #: ClassIsland weekday numbering: 0 = Sunday … 6 = Saturday.
@@ -755,7 +766,30 @@ class ClassIslandConfigParser:
 
         chosen = matching[0]
         chosen.matches_day = chosen.weekday == wanted
+        # 顺带把「时间表名」（TimeLayouts 里的 Name）取出来：界面上要给用户看的
+        # 是时间表名，而不是课程表（ClassPlan）名——两者在 ClassIsland 里是不同的东西。
+        chosen.layout_name = self._time_layout_name(profile, chosen.layout_id)
         return chosen
+
+    def _time_layout_name(self, profile_file: str, layout_id: str) -> str:
+        """读取档案里 ``TimeLayouts[layout_id].Name``（读不到返回空串）。"""
+        profiles_dir = self.profiles_dir
+        if profiles_dir is None or not layout_id:
+            return ""
+        path = profiles_dir / profile_file
+        if not path.is_file():
+            return ""
+        data, _used_backup, _warning, error = self.load_json_with_backup(path)
+        if error is not None:
+            return ""
+        container = _find_key(data, "TimeLayouts", "time_layouts", "TimeLayout")
+        if not isinstance(container, dict):
+            return ""
+        raw_layout = container.get(layout_id)
+        if not isinstance(raw_layout, dict):
+            return ""
+        name = _find_key(raw_layout, "Name", "name")
+        return str(name).strip() if isinstance(name, str) else ""
 
     def scan_all_layouts(self) -> List[TimeLayoutOption]:
         """Scan **every** ``Profiles/*.json`` and return all timetables.

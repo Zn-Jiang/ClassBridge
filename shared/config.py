@@ -1,3 +1,4 @@
+import contextlib
 import os
 from dataclasses import dataclass, field
 from datetime import time
@@ -211,9 +212,21 @@ def _dump_server_toml(config: ServerConfig) -> str:
 
 CLIENT_CONFIG_ENV_VAR = "KG_CLIENT_CONFIG"
 
+#: 客户端**配置文件**版本（与客户端程序版本解耦）。
+#:
+#: * 只在新版客户端需要"重新解释/迁移"旧配置时递增（例如新增字段的默认值、
+#:   字段含义变化、旧值需要换算）；
+#: * 多个不同版本的客户端可以共用同一个配置文件版本；
+#: * ``client.toml`` 里会记录 ``config_version``，客户端启动时与这个常量比对：
+#:   - 文件版本 < 当前要求 → 视为旧配置，补齐/迁移后按新版本写回；
+#:   - 文件版本 > 当前要求 → 配置文件来自更新的客户端，只提示、不降级覆盖。
+CLIENT_CONFIG_VERSION = 1
+
 
 @dataclass
 class ClientConfig:
+    #: 读到的配置文件版本（默认取当前要求版本；见 CLIENT_CONFIG_VERSION）
+    config_version: int = CLIENT_CONFIG_VERSION
     internal_token: str = "dev-internal-token"
     server_ws_url: str = "ws://127.0.0.1:8765/ws/client"
     log_level: str = "INFO"
@@ -264,6 +277,13 @@ class ClientConfig:
 
 
 def load_client_config(config_path: Optional[Path] = None) -> ClientConfig:
+    """读取客户端配置，并把**配置文件版本**与客户端要求的版本比对。
+
+    * 文件里没有 ``config_version``（老配置）或版本更低 → 记为旧版本，日志提示，
+      并**立即按当前版本补齐/写回**（新增字段用默认值，旧值原样保留）；
+    * 版本更高 → 说明这份配置来自更新的客户端，只提示"可能缺少本版本认识的字段"，
+      不做覆盖，避免把新配置写坏。
+    """
     path = _resolve_path(config_path, CLIENT_CONFIG_ENV_VAR, CLIENT_CONFIG_PATH)
     if not path.exists():
         return ClientConfig()
@@ -272,6 +292,23 @@ def load_client_config(config_path: Optional[Path] = None) -> ClientConfig:
     section = raw.get("client", {})
     sched = raw.get("schedule", {})
     challenge = raw.get("challenge", {})
+
+    file_version = _client_config_version_from(raw, section)
+    if file_version < CLIENT_CONFIG_VERSION:
+        logger.info(
+            "客户端配置文件版本为 %s，当前需要 %s：将补齐缺失项并按新版本写回（%s）",
+            file_version,
+            CLIENT_CONFIG_VERSION,
+            path,
+        )
+    elif file_version > CLIENT_CONFIG_VERSION:
+        logger.warning(
+            "客户端配置文件版本为 %s，高于本客户端需要的 %s：配置可能来自更新的客户端，"
+            "本版本只会读取自己认识的字段（%s）",
+            file_version,
+            CLIENT_CONFIG_VERSION,
+            path,
+        )
 
     breaks = [
         ScheduleBreak(
@@ -282,7 +319,8 @@ def load_client_config(config_path: Optional[Path] = None) -> ClientConfig:
         for idx, item in enumerate(sched.get("breaks", []), start=1)
     ]
 
-    return ClientConfig(
+    config = ClientConfig(
+        config_version=file_version,
         internal_token=_opt_str(raw.get("internal_token"), ClientConfig().internal_token),
         server_ws_url=_opt_str(raw.get("server_ws_url"), ClientConfig().server_ws_url),
         log_level=_opt_str(raw.get("log_level"), ClientConfig().log_level),
@@ -319,16 +357,69 @@ def load_client_config(config_path: Optional[Path] = None) -> ClientConfig:
         fallback_answer=_opt_str(challenge.get("fallback_answer"), ClientConfig().fallback_answer),
     )
 
+    # 旧版本的配置：补齐后立即按当前版本写回（只读不写会让版本号永远停在旧值）
+    if file_version < CLIENT_CONFIG_VERSION:
+        with contextlib.suppress(OSError):
+            migrate_client_config(config, config_path)
+
+    return config
+
 
 def save_client_config(config: ClientConfig, config_path: Optional[Path] = None) -> Path:
+    """写回客户端配置。
+
+    写入时把 ``config_version`` 更新为当前客户端要求的版本（见
+    ``CLIENT_CONFIG_VERSION``）——迁移/补齐发生在这里，读的时候只负责比对与提示。
+    """
     path = _resolve_path(config_path, CLIENT_CONFIG_ENV_VAR, CLIENT_CONFIG_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if config.config_version != CLIENT_CONFIG_VERSION:
+        logger.debug(
+            "写入配置时把 config_version 从 %s 更新为 %s",
+            config.config_version,
+            CLIENT_CONFIG_VERSION,
+        )
+        config.config_version = CLIENT_CONFIG_VERSION
     path.write_text(_dump_client_toml(config), encoding="utf-8")
     return path
 
 
+def migrate_client_config(config: ClientConfig, config_path: Optional[Path] = None) -> bool:
+    """把旧版本的配置文件就地升级（补齐缺失项并写入新版本号）。
+
+    返回是否真的写过文件。仅当读到的版本低于当前要求时才写，避免每次启动都
+    重写配置（那样会打乱用户手动添加的注释/顺序，也会平白产生磁盘写入）。
+    """
+    if config.config_version >= CLIENT_CONFIG_VERSION:
+        return False
+    path = save_client_config(config, config_path)
+    logger.info(
+        "客户端配置已升级到版本 %s：%s（原有取值保留，新增项使用默认值）",
+        CLIENT_CONFIG_VERSION,
+        path,
+    )
+    return True
+
+
+def _client_config_version_from(raw: Dict[str, Any], section: Dict[str, Any]) -> int:
+    """从配置里取 ``config_version``（顶层或 ``[client]`` 段都认，缺省为 0）。"""
+    for source in (section, raw):
+        value = source.get("config_version") if isinstance(source, dict) else None
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            logger.warning("config_version 不是整数：%r（按旧版本处理）", value)
+            return 0
+    # 完全没有记录 → 视为最老的版本，触发一次迁移
+    return 0
+
+
 def _dump_client_toml(config: ClientConfig) -> str:
     lines = [
+        f"# 配置文件版本（与客户端程序版本无关，见 shared/config.py 的 CLIENT_CONFIG_VERSION）",
+        f"config_version = {CLIENT_CONFIG_VERSION}",
         f'internal_token = "{_esc(config.internal_token)}"',
         f'server_ws_url = "{_esc(config.server_ws_url)}"',
         f'log_level = "{_esc(config.log_level)}"',

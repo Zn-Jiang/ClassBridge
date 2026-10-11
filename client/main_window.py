@@ -1355,6 +1355,8 @@ class MainWindow(FluentWindow):
         #: 考试静默模式（服务端/设置页设置）；开启期间不弹任何窗口
         self._exam_mode = False
         self._exam_notice_shown = False
+        #: 桥接器是否**曾经**给出过可用状态；用于区分"僵尸桥接器"和"当天没课表"
+        self._ci_state_ever_usable = False
         # True while the bridge is reachable but cannot report class/break
         # (no timetable loaded/enabled): breaks are then derived from a
         # timetable so the reported state is not stuck on "in class".
@@ -2037,6 +2039,7 @@ class MainWindow(FluentWindow):
             self._ci_state_unusable = False
             logger.info("ClassIsland bridge reports a usable state again; live events restored")
             self._apply_schedule_mode(announce=False)
+        self._ci_state_ever_usable = True
         self._set_break_state(in_break)
         self._refresh_settings_status()
 
@@ -2058,9 +2061,14 @@ class MainWindow(FluentWindow):
         self._apply_schedule_mode(
             announce=True, reason="ClassIsland 未加载课表，已按课表推算课间状态"
         )
-        # The usual cause is a *zombie* bridge: ClassIsland restarted, the IPC
-        # link died, and the bridge keeps answering with default values ever
-        # after.  Restart it in the background so live events can come back.
+        # 只有"本来能用、后来读不到"才怀疑是僵尸桥接器需要重启。
+        # 若从头到尾都读不到（例如当天没有课表），重启桥接器也解决不了问题，
+        # 反而会杀掉一个健康进程，所以这种情况下只降级、不重启。
+        if not self._ci_state_ever_usable:
+            logger.info(
+                "Bridge never reported a usable state (当天无课表或桥接器从未连通) — not restarting it"
+            )
+            return
         self._schedule_bridge_revival()
 
     # -- zombie bridge revival ---------------------------------------------
@@ -2825,12 +2833,13 @@ class MainWindow(FluentWindow):
             (schedule.layout_id or "未记录")[:8],
             schedule.layout_name or "?",
             plan.layout_id[:8],
-            plan.label,
+            plan.display_name,
         )
         # 不一致：设置页出现「重新导入时间表」按钮（用户点“暂不”后仍可手动触发）
+        # 提示里显示的是「时间表名」（TimeLayout.Name），不是课程表名。
         self.settings_page.set_schedule_outdated(
             True,
-            f"ClassIsland 当前使用的是「{plan.label}」，与本地导入的"
+            f"ClassIsland 当前使用的是「{plan.display_name}」，与本地导入的"
             f"「{schedule.layout_name or '未知'}」不一致，点击可重新导入。",
         )
 
@@ -2852,7 +2861,7 @@ class MainWindow(FluentWindow):
             with contextlib.suppress(Exception):
                 self.tray.showMessage(
                     "课表可能有更新",
-                    f"ClassIsland 当前课表为「{plan.label}」，与本地已导入的不同。打开主窗口可重新导入。",
+                    f"ClassIsland 当前时间表为「{plan.display_name}」，与本地已导入的不同。打开主窗口可重新导入。",
                 )
 
     def _on_reimport_schedule(self) -> None:
@@ -2864,7 +2873,7 @@ class MainWindow(FluentWindow):
         )
         plan = parser.active_class_plan(profile or None)
         if plan is None:
-            self._show_warning("未找到 ClassIsland 当前启用的课表，无法重新导入")
+            self._show_warning("未找到 ClassIsland 当前启用的时间表，无法重新导入")
             return
         logger.info("Manual timetable re-import requested for layout %s", plan.layout_id[:8])
         self._declined_schedule_layouts.discard(plan.layout_id)
@@ -2881,7 +2890,7 @@ class MainWindow(FluentWindow):
         current = self._schedule_store.current()
         box = MessageBox(
             "课表已更新",
-            f"ClassIsland 当前启用的课表是「{plan.label}」，"
+            f"ClassIsland 当前启用的时间表是「{plan.display_name}」，"
             f"与本地已导入的「{current.layout_name or '未知'}」不一致。\n\n"
             "是否现在重新导入本地课表？（降级到本地课表时会用到它）",
             self,

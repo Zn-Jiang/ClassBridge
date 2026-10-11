@@ -264,7 +264,8 @@ async def handle_ai_classify(bot: Bot, event: MessageEvent) -> None:
 
     # The classifier uses the module-level client configured at start-up.
     # 带上发送者群昵称（如「张三妈妈」），避免家长称呼自己孩子时被误判成在叫别人。
-    is_notification = await classify_message(content, sender_name=_sender_name(event))
+    # 注意：这里用 _ai_sender_name（只给群名片/昵称），绝不能把 QQ 号发给第三方 AI。
+    is_notification = await classify_message(content, sender_name=_ai_sender_name(event))
 
     if not is_notification:
         # 记进库里（状态 ignored）但不转发：家长随后只发 @机器人 就能把它补发出去
@@ -582,6 +583,16 @@ async def _reply(bot: Bot, event: MessageEvent, text: str) -> None:
 
 def _sender_name(event: MessageEvent) -> str:
     return str(event.sender.card or event.sender.nickname or event.user_id)
+
+
+def _ai_sender_name(event: MessageEvent) -> str:
+    """发给 AI 的发送者名称：**只取群名片/昵称**，两者都没有时返回空串。
+
+    与 :func:`_sender_name` 的区别是**不回退到 QQ 号**：AI 分类会把这段文字发给
+    DeepSeek，隐私政策里明确写着"不发送 QQ 号"，所以宁可少一条身份线索，也不外发
+    QQ 号（没有昵称时 AI 退化为只看消息文本，与旧行为一致）。
+    """
+    return str(event.sender.card or event.sender.nickname or "").strip()
 
 
 def _is_self_message(event: MessageEvent) -> bool:

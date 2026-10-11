@@ -38,6 +38,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -63,10 +64,105 @@ CIB_PROCESS_NAME = "ClassIsland.WSBridge.exe"
 #: :data:`CIB_PROCESS_NAME` misses real installations (and would refuse to
 #: restart them).
 CIB_PROCESS_PREFIX = "classisland.wsbridge"
-#: Port the bridge listens on.
+#: Port the bridge listens on by default.
 CIB_PORT = 6614
 #: WebSocket endpoint exposed by CIB 2.0 (the listener serves the root path).
 CIB_WS_URL = f"ws://localhost:{CIB_PORT}/"
+
+# ---------------------------------------------------------------------------
+# 新版 CIB：端口可能不是 6614，启动成功后会把端口写进 port.txt
+# ---------------------------------------------------------------------------
+
+#: port.txt 所在目录（相对 %APPDATA%）：``%APPDATA%/Zn-Jiang/ClassIsland Bridge/port.txt``
+BRIDGE_PORT_DIR_NAME = "Zn-Jiang"
+BRIDGE_PORT_SUBDIR_NAME = "ClassIsland Bridge"
+BRIDGE_PORT_FILE_NAME = "port.txt"
+
+#: 新版 CIB 在"与 ClassIsland 的 IPC 已断开"时，除 capabilities 外的请求都返回这句
+OFFLINE_REPLY = "ClassIsland 已离线"
+
+#: 设成 ``1`` 时 :func:`launch_cib` 只打日志、绝不真的启动桥接器。
+#: 给测试/排查用（回归脚本统一设置），避免在开发机上拉起一堆僵尸桥接器进程。
+_NO_LAUNCH_ENV_VAR = "KG_NO_CIB_LAUNCH"
+
+
+def bridge_port_file() -> Path:
+    """返回 port.txt 的路径（新版 CIB 启动成功后写入监听端口）。"""
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return (
+            Path(appdata)
+            / BRIDGE_PORT_DIR_NAME
+            / BRIDGE_PORT_SUBDIR_NAME
+            / BRIDGE_PORT_FILE_NAME
+        )
+    return Path.home() / ".classisland-bridge" / BRIDGE_PORT_FILE_NAME
+
+
+def read_bridge_port() -> Optional[int]:
+    """读取 port.txt 里记录的端口（纯整数）；读不到或格式不对返回 ``None``。"""
+    path = bridge_port_file()
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        logger.debug("没有找到桥接器端口文件：%s", path)
+        return None
+    except OSError as exc:
+        logger.warning("读取桥接器端口文件失败（%s）：%s", path, exc)
+        return None
+
+    match = re.search(r"\d+", raw)
+    if match is None:
+        logger.warning("桥接器端口文件内容无法解析：%r", raw[:40])
+        return None
+    port = int(match.group(0))
+    if not (1 <= port <= 65535):
+        logger.warning("桥接器端口文件里的端口不合法：%s", port)
+        return None
+    logger.info("从 port.txt 读到桥接器端口：%s", port)
+    return port
+
+
+def bridge_url_candidates(
+    configured: Optional[str] = None,
+    *,
+    default_port: int = CIB_PORT,
+) -> List[str]:
+    """按尝试顺序给出桥接器 WebSocket 地址。
+
+    规则（用户要求）：**先试 6614**；连不上就去看 port.txt 里记的端口再试；
+    都失败说明桥接器没起来/启动失败。显式配置了非默认地址时它排在最前。
+    """
+    candidates: List[str] = []
+    configured = (configured or "").strip()
+    default_url = f"ws://localhost:{default_port}/"
+
+    if configured:
+        candidates.append(configured)
+    if default_url not in candidates:
+        candidates.append(default_url)
+
+    port = read_bridge_port()
+    if port is not None and port != default_port:
+        discovered = f"ws://localhost:{port}/"
+        if discovered not in candidates:
+            candidates.append(discovered)
+    return candidates
+
+
+def is_offline_reply(text: Any) -> bool:
+    """桥接器是否用"ClassIsland 已离线"回复了这次请求。
+
+    新版 CIB 在 IPC 断开时，除 ``capabilities`` 外的请求都返回这句话（纯文本，
+    不是 JSON），客户端据此把状态判为"不可用"并降级，而不是当成解析错误。
+    """
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return OFFLINE_REPLY in stripped or "已离线" in stripped
+
 #: Capability / subscription that proves the bridge can report break times.
 BREAK_EVENT_CAPABILITY = "OnBreakingTimeNotifyId"
 #: Subscription for "class started" events.
@@ -545,6 +641,15 @@ def kill_process(pid: int, timeout: float = 3.0) -> bool:
 
 def launch_cib(exe_path: Path) -> Optional[subprocess.Popen]:
     """Start the bridge; returns the process handle or ``None`` on failure."""
+    # 测试/排查用的保险丝：设了 KG_NO_CIB_LAUNCH=1 就绝不去启动真实的桥接器。
+    # 回归脚本会统一设置它——UI 测试会真的构造主窗口，一旦走到"拉起桥接器"
+    # 就会在开发机上留下一堆连不上 ClassIsland 的僵尸进程。生产环境不会设这个变量。
+    if os.environ.get(_NO_LAUNCH_ENV_VAR, "").strip() not in ("", "0", "false", "False"):
+        logger.warning(
+            "CIB 启动被 %s 阻止（测试模式），跳过启动：%s", _NO_LAUNCH_ENV_VAR, exe_path
+        )
+        return None
+
     creationflags = 0
     if sys.platform == "win32":
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -847,11 +952,20 @@ async def revive_bridge(
     conflict_process: Optional[str] = None
     conflict_pid: Optional[int] = None
 
-    # Prefer the *process* over the port owner: Windows sometimes attributes an
-    # elevated process's listening socket to PID 4 (System), and there is no
-    # point refusing a restart because of that.
+    # Windows 有时会把提权进程的监听套接字算到 PID 4（System）名下，此时端口归属
+    # 不可用，只能改按"桥接器进程"定位；但如果端口确实被某个**具名的外部进程**占用
+    # （如 chrome.exe），仍要以它为准并拒绝重启——绝不能因为别处有个桥接器进程，
+    # 就去动系统里的其它进程。
     process_holder = running
-    if process_holder is not None:
+    if process_holder is not None and _port_owner_unknown(holder):
+        if holder is not None:
+            logger.info(
+                "端口 %s 的占用者 %s (PID %s) 无法确认，改按桥接器进程 %s 处理",
+                port,
+                holder[0],
+                holder[1],
+                process_holder[0],
+            )
         holder = process_holder
 
     if holder is not None:
@@ -936,6 +1050,22 @@ async def revive_bridge(
         conflict_process=conflict_process,
         conflict_pid=conflict_pid,
     )
+
+
+def _port_owner_unknown(holder: Optional[Tuple[str, int]]) -> bool:
+    """端口占用者是否"无法确认"（此时可以改按桥接器进程判断）。
+
+    Windows 会把提权进程的监听套接字算到 ``System``（PID 4）名下，psutil 也可能
+    读不到名字而给出"未知进程"。这两种情况都无法据此判断是否是我们自己的桥接器，
+    于是改用桥接器进程定位；但一个**具名**的外部进程（chrome.exe 等）必须照旧
+    拒绝重启。
+    """
+    if holder is None:
+        return True
+    name = str(holder[0] or "").strip().lower()
+    if not name or name in {"system", "system idle process", "unknown"}:
+        return True
+    return name.startswith("未知进程") or "无法访问" in name
 
 
 def describe_degradation(result: CibEnsureResult) -> str:
