@@ -65,9 +65,10 @@ HANDOFF.md
 #client
 client/schedule/test.json
 
-# Bundled ClassIsland bridge binary (~68MB, built from classisland-ws-bridge/)
-# and any other packaged client binaries — deploy by copying, not via git.
-client/bin/
+# Bundled ClassIsland bridge binary: 默认忽略（旧版约 68MB，靠拷贝部署），
+# 但新版 CIB 只有 ~3MB 且必须随仓库分发，因此单独放行这一支。
+client/bin/*
+!client/bin/ClassIsland.WSBridge_v2.0_win-x64.exe
 
 # Third-party reference code (not part of the product)
 other/
